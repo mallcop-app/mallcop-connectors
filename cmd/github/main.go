@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ const (
 	apiBase      = "https://api.github.com"
 	cursorMaxLen = 1000
 	perPage      = "100"
+	maxRetries   = 3
 )
 
 // cursorRE accepts base64 standard + URL-safe alphabet plus padding.
@@ -184,14 +186,15 @@ func parseAfterCursor(linkHeader string) string {
 
 // connector polls the GitHub audit log and emits events to w.
 type connector struct {
-	client         *http.Client
-	org            string
-	since          time.Time
-	cursor         string // raw GitHub cursor
-	appID          int64
-	installationID int64
-	out            io.Writer
-	maxPages       int // 0 = unlimited
+	client          *http.Client
+	org             string
+	since           time.Time
+	cursor          string // raw GitHub cursor
+	appID           int64
+	installationID  int64
+	out             io.Writer
+	maxPages        int           // 0 = unlimited
+	retryBaseDelay  time.Duration // initial backoff delay; 0 = default 1s
 }
 
 func (c *connector) authHeaders() map[string]string {
@@ -226,6 +229,50 @@ func (c *connector) get(ctx context.Context, rawURL string, params url.Values) (
 	return c.client.Do(req)
 }
 
+// getWithRetry wraps get with exponential backoff on HTTP 429.
+// It reads the X-RateLimit-Reset header for the wait time when present,
+// falling back to exponential backoff (1s, 2s, 4s). Max retries: maxRetries.
+func (c *connector) getWithRetry(ctx context.Context, rawURL string, params url.Values) (*http.Response, error) {
+	backoff := c.retryBaseDelay
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+	for attempt := 0; ; attempt++ {
+		resp, err := c.get(ctx, rawURL, params)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			return resp, nil
+		}
+		// 429 — consume body to allow connection reuse.
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if attempt >= maxRetries {
+			return nil, fmt.Errorf("rate limited after %d retries", maxRetries)
+		}
+
+		// Determine wait duration.
+		wait := backoff
+		if reset := resp.Header.Get("X-RateLimit-Reset"); reset != "" {
+			if unix, err := strconv.ParseInt(reset, 10, 64); err == nil {
+				if d := time.Until(time.Unix(unix, 0)); d > 0 {
+					wait = d
+				}
+			}
+		}
+		fmt.Fprintf(os.Stderr, "rate limited: retry %d/%d after %s\n", attempt+1, maxRetries, wait.Round(time.Millisecond))
+		backoff *= 2
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, error) {
 	params := url.Values{"per_page": []string{perPage}}
 	if !c.since.IsZero() && c.cursor == "" {
@@ -253,10 +300,10 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, 
 		var err error
 
 		if isFirst {
-			resp, err = c.get(ctx, currentURL, params)
+			resp, err = c.getWithRetry(ctx, currentURL, params)
 			isFirst = false
 		} else {
-			resp, err = c.get(ctx, currentURL, nil)
+			resp, err = c.getWithRetry(ctx, currentURL, nil)
 		}
 		if err != nil {
 			return nil, "", fmt.Errorf("GET %s: %w", currentURL, err)
