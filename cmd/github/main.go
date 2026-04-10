@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -117,7 +118,11 @@ func normalizeEntry(entry auditLogEntry, org string) (*event.Event, error) {
 		case float64:
 			ts = time.UnixMilli(int64(v)).UTC()
 		case string:
-			ts, _ = time.Parse(time.RFC3339, v)
+			var err error
+			ts, err = time.Parse(time.RFC3339, v)
+			if err != nil {
+				log.Printf("warn: failed to parse created_at timestamp %q: %v, falling back to time.Now()", v, err)
+			}
 		}
 	}
 	if ts.IsZero() {
@@ -284,7 +289,11 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, 
 					case float64:
 						entryTS = time.UnixMilli(int64(v)).UTC()
 					case string:
-						entryTS, _ = time.Parse(time.RFC3339, v)
+						var err error
+						entryTS, err = time.Parse(time.RFC3339, v)
+						if err != nil {
+							log.Printf("warn: failed to parse entry timestamp %q for --since comparison: %v", v, err)
+						}
 					}
 					if !entryTS.IsZero() && entryTS.Before(c.since) {
 						// All subsequent entries (and pages) will be older — stop.
