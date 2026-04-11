@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., v0.0.1-test)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          OUTDIR="dist"
+          mkdir -p "${OUTDIR}"
+
+          # Enumerate cmd/* dynamically so new connectors ship automatically.
+          mapfile -t CMDS < <(ls -1 cmd/)
+          echo "Building ${#CMDS[@]} connectors: ${CMDS[*]}"
+
+          declare -a TARGETS=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/arm64"
+          )
+
+          for TARGET in "${TARGETS[@]}"; do
+            OS="${TARGET%/*}"
+            ARCH="${TARGET#*/}"
+            LABEL="${OS}-${ARCH}"
+
+            STAGE="${OUTDIR}/stage-${LABEL}/bin"
+            mkdir -p "${STAGE}"
+
+            for CMD in "${CMDS[@]}"; do
+              CGO_ENABLED=0 GOOS="${OS}" GOARCH="${ARCH}" go build \
+                -ldflags "${LDFLAGS}" \
+                -o "${STAGE}/${CMD}" \
+                "./cmd/${CMD}/"
+            done
+
+            tar -czf "${OUTDIR}/mallcop-connectors-${LABEL}.tar.gz" \
+              -C "${OUTDIR}/stage-${LABEL}" \
+              bin
+
+            rm -rf "${OUTDIR}/stage-${LABEL}"
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          for f in *.tar.gz; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          cat *.sha256
+
+      - name: Verify all platforms built
+        run: |
+          cd dist
+          for LABEL in linux-amd64 linux-arm64 darwin-arm64; do
+            if [ ! -f "mallcop-connectors-${LABEL}.tar.gz" ]; then
+              echo "FATAL: missing mallcop-connectors-${LABEL}.tar.gz"
+              exit 1
+            fi
+            if [ ! -f "mallcop-connectors-${LABEL}.tar.gz.sha256" ]; then
+              echo "FATAL: missing mallcop-connectors-${LABEL}.tar.gz.sha256"
+              exit 1
+            fi
+          done
+          echo "All 3 platforms built successfully"
+
+      - name: Generate release notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "${PREV_TAG}" ]; then
+            COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%s" --no-merges)
+          else
+            COMMITS=$(git log --pretty=format:"%s" --no-merges)
+          fi
+
+          FEATURES=""
+          FIXES=""
+          OTHER=""
+
+          while IFS= read -r line; do
+            [ -z "${line}" ] && continue
+            case "${line}" in
+              feat*)    FEATURES="${FEATURES}- ${line}"$'\n' ;;
+              fix*)     FIXES="${FIXES}- ${line}"$'\n' ;;
+              test*|docs*|chore*|rename*|Merge*) ;;
+              *)        OTHER="${OTHER}- ${line}"$'\n' ;;
+            esac
+          done <<< "${COMMITS}"
+
+          VERSION="${{ steps.version.outputs.version }}"
+          {
+            echo "## Contents"
+            echo ""
+            echo "Each tarball contains \`bin/\` with all mallcop-connectors binaries."
+            echo "Every connector emits JSONL events on stdout using the shared"
+            echo "\`pkg/event\` schema and HMAC-signed checkpoint cursors on stderr."
+            echo ""
+            echo "## Install"
+            echo ""
+            echo '```bash'
+            echo "# Download (replace PLATFORM with linux-amd64, linux-arm64, or darwin-arm64)"
+            echo "curl -fsSLO https://github.com/baron-3dl/mallcop-connectors/releases/download/${VERSION}/mallcop-connectors-PLATFORM.tar.gz"
+            echo "curl -fsSLO https://github.com/baron-3dl/mallcop-connectors/releases/download/${VERSION}/mallcop-connectors-PLATFORM.tar.gz.sha256"
+            echo "sha256sum -c mallcop-connectors-PLATFORM.tar.gz.sha256"
+            echo "tar xzf mallcop-connectors-PLATFORM.tar.gz"
+            echo "ls bin/"
+            echo '```'
+            echo ""
+            if [ -n "${FEATURES}" ]; then
+              echo "### Features"
+              echo ""
+              echo "${FEATURES}"
+            fi
+            if [ -n "${FIXES}" ]; then
+              echo "### Fixes"
+              echo ""
+              echo "${FIXES}"
+            fi
+            if [ -n "${OTHER}" ]; then
+              echo "### Other"
+              echo ""
+              echo "${OTHER}"
+            fi
+            if [ -n "${PREV_TAG}" ]; then
+              echo "---"
+              echo ""
+              echo "**Full changelog**: [\`${PREV_TAG}...${VERSION}\`](https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${VERSION})"
+            fi
+          } > /tmp/release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          body_path: /tmp/release_notes.md
+          generate_release_notes: false
+          files: |
+            dist/mallcop-connectors-*.tar.gz
+            dist/mallcop-connectors-*.tar.gz.sha256
