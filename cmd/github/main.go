@@ -184,6 +184,22 @@ func parseAfterCursor(linkHeader string) string {
 	return u.Query().Get("after")
 }
 
+// bearerTokenTransport is an http.RoundTripper that stamps every outbound
+// request with a fixed Authorization: Bearer <token> header. Used when the
+// connector is handed a pre-minted GitHub installation access token (via
+// --installation-token) instead of minting one from an App key.
+type bearerTokenTransport struct {
+	token string
+	next  http.RoundTripper
+}
+
+func (b *bearerTokenTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	// Clone the request so we don't mutate the caller's headers.
+	clone := r.Clone(r.Context())
+	clone.Header.Set("Authorization", "Bearer "+b.token)
+	return b.next.RoundTrip(clone)
+}
+
 // connector polls the GitHub audit log and emits events to w.
 type connector struct {
 	client          *http.Client
@@ -379,24 +395,28 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, 
 
 func run() error {
 	var (
-		appID          = flag.Int64("app-id", 0, "GitHub App ID")
-		installationID = flag.Int64("installation-id", 0, "GitHub App Installation ID")
-		privateKeyPath = flag.String("private-key-path", "", "Path to GitHub App private key PEM file")
-		org            = flag.String("org", "", "GitHub organization name")
-		since          = flag.String("since", "", "ISO 8601 timestamp to filter events (e.g. 2024-01-01T00:00:00Z)")
-		cursor         = flag.String("cursor", "", "Checkpoint cursor from previous run (base64-encoded, HMAC-signed)")
+		appID             = flag.Int64("app-id", 0, "GitHub App ID (required when --installation-token is not set)")
+		installationID    = flag.Int64("installation-id", 0, "GitHub App Installation ID")
+		privateKeyPath    = flag.String("private-key-path", "", "Path to GitHub App private key PEM file (required when --installation-token is not set)")
+		installationToken = flag.String("installation-token", "", "Pre-minted GitHub installation access token. When set, --app-id and --private-key-path are ignored. Use this path when mallcop-pro mints the token for you via POST /v1/github/token.")
+		org               = flag.String("org", "", "GitHub organization name")
+		since             = flag.String("since", "", "ISO 8601 timestamp to filter events (e.g. 2024-01-01T00:00:00Z)")
+		cursor            = flag.String("cursor", "", "Checkpoint cursor from previous run (base64-encoded, HMAC-signed)")
 	)
 	flag.Parse()
 
-	// Validate required flags — no PAT support.
-	if *appID == 0 {
-		return fmt.Errorf("--app-id is required (GitHub App auth only, no PAT support)")
-	}
+	// Validate required flags.
 	if *installationID == 0 {
 		return fmt.Errorf("--installation-id is required")
 	}
-	if *privateKeyPath == "" {
-		return fmt.Errorf("--private-key-path is required")
+	if *installationToken == "" {
+		// Self-mint path: need app id + private key.
+		if *appID == 0 {
+			return fmt.Errorf("--app-id is required when --installation-token is not set")
+		}
+		if *privateKeyPath == "" {
+			return fmt.Errorf("--private-key-path is required when --installation-token is not set")
+		}
 	}
 	if *org == "" {
 		return fmt.Errorf("--org is required")
@@ -423,14 +443,33 @@ func run() error {
 		}
 	}
 
-	// Set up GitHub App installation auth transport.
-	itr, err := ghinstallation.NewKeyFromFile(http.DefaultTransport, *appID, *installationID, *privateKeyPath)
-	if err != nil {
-		return fmt.Errorf("failed to create GitHub App installation auth: %w", err)
+	// Set up the authenticated HTTP client. Two paths:
+	//
+	//  1. --installation-token: caller (e.g. mallcop-pro /v1/github/token)
+	//     already minted an installation access token. We use it as a
+	//     static Bearer via bearerTokenTransport. This is the preferred
+	//     path for customer deploys that don't hold the GitHub App key.
+	//
+	//  2. --app-id + --private-key-path: legacy / operator path. The
+	//     connector mints its own token via ghinstallation.
+	var httpClient *http.Client
+	if *installationToken != "" {
+		httpClient = &http.Client{
+			Transport: &bearerTokenTransport{
+				token: *installationToken,
+				next:  http.DefaultTransport,
+			},
+		}
+	} else {
+		itr, err := ghinstallation.NewKeyFromFile(http.DefaultTransport, *appID, *installationID, *privateKeyPath)
+		if err != nil {
+			return fmt.Errorf("failed to create GitHub App installation auth: %w", err)
+		}
+		httpClient = &http.Client{Transport: itr}
 	}
 
 	conn := &connector{
-		client:         &http.Client{Transport: itr},
+		client:         httpClient,
 		org:            *org,
 		since:          sinceTime,
 		cursor:         rawCursor,
