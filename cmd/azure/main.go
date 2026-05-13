@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/thirdiv/mallcop-connectors/pkg/event"
+	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 const (

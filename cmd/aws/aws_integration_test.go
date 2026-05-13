@@ -13,7 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
-	"github.com/thirdiv/mallcop-connectors/pkg/event"
+	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 // TestAWSCloudTrailIntegration exercises the real CloudTrail LookupEvents API.

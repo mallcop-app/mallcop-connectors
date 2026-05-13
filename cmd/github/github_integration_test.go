@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/thirdiv/mallcop-connectors/pkg/event"
+	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 // TestGitHubAuditLogIntegration exercises the real GitHub API via GitHub App auth

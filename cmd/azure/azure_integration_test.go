@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thirdiv/mallcop-connectors/pkg/event"
+	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 // TestAzureActivityLogIntegration exercises the real Azure Monitor Activity Logs API.

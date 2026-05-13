@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"google.golang.org/api/logging/v2"
-	"github.com/thirdiv/mallcop-connectors/pkg/event"
+	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 func TestCursorRoundtrip(t *testing.T) {
