@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thirdiv/mallcop-connectors/pkg/event"
+	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 // TestM365AuditLogIntegration exercises the real Office 365 Management Activity API.

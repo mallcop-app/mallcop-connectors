@@ -28,7 +28,7 @@ import (
 	"google.golang.org/api/logging/v2"
 	"google.golang.org/api/option"
 
-	"github.com/thirdiv/mallcop-connectors/pkg/event"
+	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 const (
