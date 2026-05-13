@@ -1,32 +1,128 @@
 # mallcop-connectors
 
-Go library — mallcop connector implementations for 108+ cloud services. Each connector fetches security-relevant data from a single service API.
+> Data-source connectors for [mallcop](https://github.com/mallcop-app/mallcop) — single-binary ingestors that normalize cloud audit logs into mallcop event JSONL.
 
-## Overview
+## Connectors
 
-mallcop-connectors provides a unified interface for fetching security-relevant configuration and audit data from cloud services, developer tools, payment systems, auth providers, and more.
-
-## Architecture
-
-```
-mallcop-skills
-  → mallcop-connectors (this repo)
-    → Service APIs (AWS, GCP, Azure, GitHub, Stripe, ...)
-```
+| Connector | Service | Auth | Status |
+|---|---|---|---|
+| `aws` | AWS CloudTrail | aws-sdk-go-v2 (env/profile) | stable |
+| `azure` | Azure Activity Log | Service principal (OAuth2) | stable |
+| `gcp` | GCP Cloud Logging | Service account JSON | stable |
+| `github` | GitHub Audit Log | GitHub App installation | stable |
+| `m365` | Office 365 Management Activity API | App registration | stable |
+| `okta` | Okta System Log | SSWS token | stable |
 
 Each connector:
-1. Authenticates with its target service API
-2. Fetches security-relevant configuration data
-3. Returns structured data for analysis by mallcop-skills
+- Talks to the real upstream API (no mocks at runtime).
+- Paginates with checkpoint cursors so partial runs resume correctly.
+- Normalizes output to mallcop's `event.Event` JSONL shape.
+- Is independently installable and pipeable.
 
-## Related
+## Install
 
-- Cross-repo architecture: ~/projects/mallcop-pro/CLAUDE.md
-- Parent work item: mallcoppro-eb1
-- mallcop OSS: https://github.com/thirdiv/mallcop
-- mallcop-skills: https://github.com/thirdiv/mallcop-skills
-- mallcop-legion: https://github.com/thirdiv/mallcop-legion
+```bash
+go install github.com/mallcop-app/mallcop-connectors/cmd/aws@v0.6.0
+go install github.com/mallcop-app/mallcop-connectors/cmd/azure@v0.6.0
+go install github.com/mallcop-app/mallcop-connectors/cmd/gcp@v0.6.0
+go install github.com/mallcop-app/mallcop-connectors/cmd/github@v0.6.0
+go install github.com/mallcop-app/mallcop-connectors/cmd/m365@v0.6.0
+go install github.com/mallcop-app/mallcop-connectors/cmd/okta@v0.6.0
+```
+
+Or download platform binaries from the [v0.6.0 release page](https://github.com/mallcop-app/mallcop-connectors/releases/tag/v0.6.0).
+
+## Quickstart
+
+### aws
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-east-1          # or --region flag
+aws --region us-east-1 --since 2024-01-01T00:00:00Z
+```
+
+### azure
+
+```bash
+export AZURE_TENANT_ID=...
+export AZURE_CLIENT_ID=...
+export AZURE_CLIENT_SECRET=...
+export AZURE_SUBSCRIPTION_ID=...     # or --subscription-id flag
+azure --subscription-id <id> --since 2024-01-01T00:00:00Z
+```
+
+### gcp
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
+export GCP_PROJECT_ID=my-project     # or --project flag
+gcp --project my-project --since 2024-01-01T00:00:00Z
+```
+
+### github
+
+```bash
+github \
+  --app-id 12345 \
+  --installation-id 67890 \
+  --private-key-path /path/to/private-key.pem \
+  --org my-org \
+  --since 2024-01-01T00:00:00Z
+```
+
+### m365
+
+```bash
+export M365_TENANT_ID=...
+export M365_CLIENT_ID=...
+export M365_CLIENT_SECRET=...
+m365 --since 2024-01-01T00:00:00Z
+```
+
+### okta
+
+```bash
+export OKTA_DOMAIN=myorg.okta.com
+export OKTA_API_TOKEN=...
+okta --since 2024-01-01T00:00:00Z
+```
+
+## Output format
+
+Each connector writes one JSON object per line to stdout:
+
+```json
+{"id":"abc123","source":"github","type":"org.member_added","actor":"alice","timestamp":"2024-01-15T10:30:00Z","org":"my-org","payload":{...}}
+```
+
+Pipe to `mallcop scan` or any JSONL processor.
+
+## Configuration
+
+Connector auth is env-driven. See [`cmd/<name>/README.md`](cmd/) for the specific environment variables, required IAM/API permissions, and known limitations of each connector.
+
+## Resuming from a checkpoint
+
+All connectors accept a `--cursor` flag. On success, the last cursor value is printed to stderr. Pass it back on the next run to resume without duplicates:
+
+```bash
+aws --region us-east-1 2>cursor.txt | mallcop scan
+aws --region us-east-1 --cursor "$(cat cursor.txt)"
+```
+
+## Migrating from Python mallcop connectors
+
+The Go connectors aim for behavioral parity with the Python connectors of the same name. Two changes worth noting:
+
+- **Okta and GCP are new in Go** — no Python counterpart.
+- **Not yet ported from Python**: `container_logs`, `supabase`, `vercel`, `openclaw_config_drift`. If you depend on these, stay on Python mallcop 0.5.x or contribute a Go port upstream.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT — Copyright (c) 2026 Third Division Labs
+MIT. See [LICENSE](LICENSE).
