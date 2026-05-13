@@ -17,20 +17,22 @@ import (
 )
 
 // TestGitHubAuditLogIntegration exercises the real GitHub API via GitHub App auth
-// against the 3dl-dev org audit log.
+// against the org specified by GITHUB_ORG env var.
 //
 // Required env vars:
 //
 //	GITHUB_APP_ID           — numeric GitHub App ID
 //	GITHUB_INSTALLATION_ID  — numeric installation ID
 //	GITHUB_PRIVATE_KEY_PATH — path to PEM private key file
+//	GITHUB_ORG              — GitHub org name to query (e.g., "3dl-dev")
 func TestGitHubAuditLogIntegration(t *testing.T) {
 	appIDStr := os.Getenv("GITHUB_APP_ID")
 	installIDStr := os.Getenv("GITHUB_INSTALLATION_ID")
 	keyPath := os.Getenv("GITHUB_PRIVATE_KEY_PATH")
+	orgName := os.Getenv("GITHUB_ORG")
 
-	if appIDStr == "" || installIDStr == "" || keyPath == "" {
-		t.Skip("GITHUB_APP_ID, GITHUB_INSTALLATION_ID, and GITHUB_PRIVATE_KEY_PATH must be set")
+	if appIDStr == "" || installIDStr == "" || keyPath == "" || orgName == "" {
+		t.Skip("GITHUB_APP_ID, GITHUB_INSTALLATION_ID, GITHUB_PRIVATE_KEY_PATH, and GITHUB_ORG must be set")
 	}
 
 	var appID, installID int64
@@ -48,7 +50,7 @@ func TestGitHubAuditLogIntegration(t *testing.T) {
 
 	conn := &connector{
 		client:         &http.Client{Transport: itr},
-		org:            "3dl-dev",
+		org:            orgName,
 		appID:          appID,
 		installationID: installID,
 		out:            bytes.NewBuffer(nil),
@@ -62,7 +64,7 @@ func TestGitHubAuditLogIntegration(t *testing.T) {
 	}
 
 	if len(events) == 0 {
-		t.Fatal("expected ≥1 event from 3dl-dev audit log, got 0")
+		t.Fatalf("expected ≥1 event from %s audit log, got 0", orgName)
 	}
 	t.Logf("fetched %d events", len(events))
 

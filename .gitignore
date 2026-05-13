@@ -36,3 +36,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Secrets and keys
+*.pem
+*.key
+*.p12
+*.pfx
