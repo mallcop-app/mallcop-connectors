@@ -202,15 +202,15 @@ func (b *bearerTokenTransport) RoundTrip(r *http.Request) (*http.Response, error
 
 // connector polls the GitHub audit log and emits events to w.
 type connector struct {
-	client          *http.Client
-	org             string
-	since           time.Time
-	cursor          string // raw GitHub cursor
-	appID           int64
-	installationID  int64
-	out             io.Writer
-	maxPages        int           // 0 = unlimited
-	retryBaseDelay  time.Duration // initial backoff delay; 0 = default 1s
+	client         *http.Client
+	org            string
+	since          time.Time
+	cursor         string // raw GitHub cursor
+	appID          int64
+	installationID int64
+	out            io.Writer
+	maxPages       int           // 0 = unlimited
+	retryBaseDelay time.Duration // initial backoff delay; 0 = default 1s
 }
 
 func (c *connector) authHeaders() map[string]string {

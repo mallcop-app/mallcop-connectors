@@ -21,6 +21,13 @@ vendor/
 # Build output
 /dist/
 /bin/
+# Stray connector binaries built into the repo root
+/github
+/aws
+/azure
+/gcp
+/m365
+/okta
 
 # IDE
 .idea/
