@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
@@ -90,11 +91,11 @@ func sha256Hex(s string) string {
 
 // oktaLogEvent is a single Okta System Log entry (partial).
 type oktaLogEvent struct {
-	UUID        string `json:"uuid"`
-	Published   string `json:"published"`
-	EventType   string `json:"eventType"`
+	UUID           string `json:"uuid"`
+	Published      string `json:"published"`
+	EventType      string `json:"eventType"`
 	DisplayMessage string `json:"displayMessage"`
-	Actor       struct {
+	Actor          struct {
 		ID          string `json:"id"`
 		Type        string `json:"type"`
 		AlternateID string `json:"alternateId"`
@@ -108,14 +109,12 @@ type oktaLogEvent struct {
 	} `json:"target"`
 }
 
-func normalizeOktaEvent(raw map[string]interface{}, domain string) (*event.Event, error) {
-	payload, err := json.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("marshal event: %w", err)
-	}
-
-	// Extract fields.
-	eventType, _ := raw["eventType"].(string)
+// normalizeOktaEvent maps a raw Okta System Log event to one or more mallcop
+// events. The canonical Type and detector-readable Payload come from the shared
+// normalize library (NOT the raw Okta eventType, which gates no detector, and
+// whose security fields are buried under client.* / target[] / outcome.*).
+func normalizeOktaEvent(raw map[string]interface{}, domain string) ([]*event.Event, error) {
+	oktaEventType, _ := raw["eventType"].(string)
 
 	actor := ""
 	if actorMap, ok := raw["actor"].(map[string]interface{}); ok {
@@ -136,20 +135,34 @@ func normalizeOktaEvent(raw map[string]interface{}, domain string) (*event.Event
 		}
 	}
 
-	idSrc := fmt.Sprintf("okta:%s:%s:%d", domain, eventType, ts.UnixNano())
+	idSrc := fmt.Sprintf("okta:%s:%s:%d", domain, oktaEventType, ts.UnixNano())
 	if uuid, ok := raw["uuid"].(string); ok && uuid != "" {
 		idSrc = "okta:uuid:" + uuid
 	}
+	baseID := sha256Hex(idSrc)
 
-	return &event.Event{
-		ID:        sha256Hex(idSrc),
-		Source:    "okta",
-		Type:      eventType,
-		Actor:     actor,
-		Timestamp: ts,
-		Org:       domain,
-		Payload:   json.RawMessage(payload),
-	}, nil
+	results := normalize.Okta(oktaEventType, raw)
+	out := make([]*event.Event, 0, len(results))
+	for i, r := range results {
+		payload, err := r.PayloadJSON(raw)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload: %w", err)
+		}
+		id := baseID
+		if i > 0 {
+			id = sha256Hex(fmt.Sprintf("%s:%d", idSrc, i))
+		}
+		out = append(out, &event.Event{
+			ID:        id,
+			Source:    "okta",
+			Type:      r.Type,
+			Actor:     actor,
+			Timestamp: ts,
+			Org:       domain,
+			Payload:   payload,
+		})
+	}
+	return out, nil
 }
 
 // parseNextLink extracts the rel="next" URL from an Okta Link header.
@@ -171,11 +184,11 @@ func parseNextLink(linkHeader string) string {
 }
 
 type connector struct {
-	client    *http.Client
-	domain    string
-	apiToken  string
-	since     time.Time
-	nextURL   string // raw next URL from Link header
+	client   *http.Client
+	domain   string
+	apiToken string
+	since    time.Time
+	nextURL  string // raw next URL from Link header
 }
 
 func (c *connector) get(ctx context.Context, rawURL string, params url.Values) (*http.Response, error) {
@@ -256,12 +269,12 @@ func (c *connector) fetchSystemLog(ctx context.Context) ([]*event.Event, string,
 		resp.Body.Close()
 
 		for _, entry := range entries {
-			ev, err := normalizeOktaEvent(entry, c.domain)
+			evs, err := normalizeOktaEvent(entry, c.domain)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
-			allEvents = append(allEvents, ev)
+			allEvents = append(allEvents, evs...)
 		}
 
 		next := parseNextLink(linkHeader)

@@ -25,6 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
@@ -87,10 +88,18 @@ func sha256Hex(s string) string {
 	return fmt.Sprintf("%x", h[:])
 }
 
-func normalizeEvent(e types.Event, region string) (*event.Event, error) {
-	payload, err := json.Marshal(e)
+// normalizeEvent maps a raw CloudTrail event to one or more mallcop events. The
+// canonical Type and detector-readable Payload come from the shared normalize
+// library (NOT the raw CloudTrail eventName, which gates no detector). A single
+// raw event may map to multiple canonical events.
+func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
+	rawJSON, err := json.Marshal(e)
 	if err != nil {
 		return nil, fmt.Errorf("marshal event: %w", err)
+	}
+	var rawMap map[string]any
+	if err := json.Unmarshal(rawJSON, &rawMap); err != nil {
+		return nil, fmt.Errorf("decode event: %w", err)
 	}
 
 	actor := ""
@@ -98,9 +107,9 @@ func normalizeEvent(e types.Event, region string) (*event.Event, error) {
 		actor = *e.Username
 	}
 
-	eventType := ""
+	eventName := ""
 	if e.EventName != nil {
-		eventType = *e.EventName
+		eventName = *e.EventName
 	}
 
 	ts := time.Now().UTC()
@@ -112,16 +121,30 @@ func normalizeEvent(e types.Event, region string) (*event.Event, error) {
 	if e.EventId != nil {
 		idSrc = "aws:cloudtrail:" + *e.EventId
 	}
+	baseID := sha256Hex(idSrc)
 
-	return &event.Event{
-		ID:        sha256Hex(idSrc),
-		Source:    "aws",
-		Type:      eventType,
-		Actor:     actor,
-		Timestamp: ts,
-		Org:       region,
-		Payload:   json.RawMessage(payload),
-	}, nil
+	results := normalize.AWS(eventName, rawMap)
+	out := make([]*event.Event, 0, len(results))
+	for i, r := range results {
+		payload, err := r.PayloadJSON(rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload: %w", err)
+		}
+		id := baseID
+		if i > 0 {
+			id = sha256Hex(fmt.Sprintf("%s:%d", idSrc, i))
+		}
+		out = append(out, &event.Event{
+			ID:        id,
+			Source:    "aws",
+			Type:      r.Type,
+			Actor:     actor,
+			Timestamp: ts,
+			Org:       region,
+			Payload:   payload,
+		})
+	}
+	return out, nil
 }
 
 func fetchEvents(ctx context.Context, client *cloudtrail.Client, region string, since time.Time, nextToken string) ([]*event.Event, string, error) {
@@ -143,12 +166,12 @@ func fetchEvents(ctx context.Context, client *cloudtrail.Client, region string, 
 		}
 
 		for _, e := range out.Events {
-			ev, err := normalizeEvent(e, region)
+			evs, err := normalizeEvent(e, region)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping event: %v\n", err)
 				continue
 			}
-			allEvents = append(allEvents, ev)
+			allEvents = append(allEvents, evs...)
 		}
 
 		if out.NextToken == nil || *out.NextToken == "" {

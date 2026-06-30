@@ -6,8 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/api/logging/v2"
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
+	"google.golang.org/api/logging/v2"
 )
 
 func TestCursorRoundtrip(t *testing.T) {
@@ -70,22 +71,28 @@ func TestNormalizeLogEntry(t *testing.T) {
 	})
 
 	entry := &logging.LogEntry{
-		InsertId:    "insert-id-001",
-		LogName:     "projects/my-project/logs/cloudaudit.googleapis.com%2Factivity",
-		Timestamp:   "2024-06-01T12:00:00Z",
+		InsertId:     "insert-id-001",
+		LogName:      "projects/my-project/logs/cloudaudit.googleapis.com%2Factivity",
+		Timestamp:    "2024-06-01T12:00:00Z",
 		ProtoPayload: protoPayload,
 	}
 
-	ev, err := normalizeLogEntry(entry, "my-project")
+	evs, err := normalizeLogEntry(entry, "my-project")
 	if err != nil {
 		t.Fatalf("normalizeLogEntry: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	if ev.Source != "gcp" {
 		t.Errorf("Source = %q, want gcp", ev.Source)
 	}
-	if ev.Type != "google.admin.AdminService.createUser" {
-		t.Errorf("Type = %q, want createUser", ev.Type)
+	// The raw methodName gates no detector; createUser maps to canonical
+	// "member_added" so priv-escalation / new-actor can fire.
+	if ev.Type != "member_added" {
+		t.Errorf("Type = %q, want member_added", ev.Type)
 	}
 	if ev.Actor != "admin@example.com" {
 		t.Errorf("Actor = %q, want admin@example.com", ev.Actor)
@@ -107,12 +114,19 @@ func TestNormalizeLogEntry(t *testing.T) {
 
 func TestNormalizeLogEntryMissingFields(t *testing.T) {
 	entry := &logging.LogEntry{}
-	ev, err := normalizeLogEntry(entry, "proj-x")
+	evs, err := normalizeLogEntry(entry, "proj-x")
 	if err != nil {
 		t.Fatalf("normalizeLogEntry with empty entry: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 	if ev.Source != "gcp" {
 		t.Errorf("Source = %q, want gcp", ev.Source)
+	}
+	if ev.Type != normalize.CatchAll {
+		t.Errorf("Type = %q, want %q", ev.Type, normalize.CatchAll)
 	}
 	if ev.Timestamp.IsZero() {
 		t.Error("Timestamp is zero")
@@ -126,10 +140,14 @@ func TestNormalizeLogEntrySchemaRoundtrip(t *testing.T) {
 		Timestamp: "2024-01-15T08:30:00.123Z",
 	}
 
-	ev, err := normalizeLogEntry(entry, "proj-roundtrip")
+	evs, err := normalizeLogEntry(entry, "proj-roundtrip")
 	if err != nil {
 		t.Fatalf("normalizeLogEntry: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	b, err := json.Marshal(ev)
 	if err != nil {

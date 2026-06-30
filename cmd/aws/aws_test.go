@@ -75,16 +75,22 @@ func TestNormalizeEvent(t *testing.T) {
 		EventTime: &ts,
 	}
 
-	ev, err := normalizeEvent(e, "us-east-1")
+	evs, err := normalizeEvent(e, "us-east-1")
 	if err != nil {
 		t.Fatalf("normalizeEvent: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	if ev.Source != "aws" {
 		t.Errorf("Source = %q, want %q", ev.Source, "aws")
 	}
-	if ev.Type != "ConsoleLogin" {
-		t.Errorf("Type = %q, want %q", ev.Type, "ConsoleLogin")
+	// ConsoleLogin maps to the canonical "login" type (the raw eventName gates no
+	// detector). With no responseElements outcome, it is a plain login.
+	if ev.Type != "login" {
+		t.Errorf("Type = %q, want %q", ev.Type, "login")
 	}
 	if ev.Actor != "alice" {
 		t.Errorf("Actor = %q, want %q", ev.Actor, "alice")
@@ -112,10 +118,14 @@ func TestNormalizeEvent(t *testing.T) {
 func TestNormalizeEventMissingFields(t *testing.T) {
 	// Event with no username, no event name, no time.
 	e := types.Event{}
-	ev, err := normalizeEvent(e, "us-west-2")
+	evs, err := normalizeEvent(e, "us-west-2")
 	if err != nil {
 		t.Fatalf("normalizeEvent with empty fields: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	if ev.Source != "aws" {
 		t.Errorf("Source = %q, want %q", ev.Source, "aws")
@@ -136,9 +146,16 @@ func TestNormalizeEventSchema(t *testing.T) {
 	ts := time.Now().UTC()
 	e := types.Event{EventId: &id, EventName: &name, EventTime: &ts}
 
-	ev, err := normalizeEvent(e, "us-east-1")
+	evs, err := normalizeEvent(e, "us-east-1")
 	if err != nil {
 		t.Fatalf("normalizeEvent: %v", err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
+	if ev.Type != "user_created" {
+		t.Errorf("Type = %q, want %q", ev.Type, "user_created")
 	}
 
 	// Re-encode and decode to verify JSON round-trip.

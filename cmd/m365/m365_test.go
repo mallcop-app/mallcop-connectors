@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
@@ -101,19 +102,33 @@ func TestNormalizeRecord(t *testing.T) {
 		"Operation":    "UserLoggedIn",
 		"Workload":     "AzureActiveDirectory",
 		"UserId":       "alice@example.com",
+		"ClientIP":     "203.0.113.7",
 		"RecordType":   float64(15),
 	}
 
-	ev, err := normalizeRecord(raw, "tenant-001", "Audit.AzureActiveDirectory")
+	evs, err := normalizeRecord(raw, "tenant-001", "Audit.AzureActiveDirectory")
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	if ev.Source != "m365" {
 		t.Errorf("Source = %q, want m365", ev.Source)
 	}
-	if ev.Type != "AzureActiveDirectory.UserLoggedIn" {
-		t.Errorf("Type = %q, want AzureActiveDirectory.UserLoggedIn", ev.Type)
+	// The raw Workload.Operation gates no detector; UserLoggedIn maps to the
+	// canonical "login" type so unusual-login can fire, with ip in the payload.
+	if ev.Type != "login" {
+		t.Errorf("Type = %q, want login", ev.Type)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if p["ip"] != "203.0.113.7" {
+		t.Errorf("payload ip = %v, want 203.0.113.7", p["ip"])
 	}
 	if ev.Actor != "alice@example.com" {
 		t.Errorf("Actor = %q, want alice@example.com", ev.Actor)
@@ -131,12 +146,19 @@ func TestNormalizeRecord(t *testing.T) {
 }
 
 func TestNormalizeRecordMissingFields(t *testing.T) {
-	ev, err := normalizeRecord(map[string]interface{}{}, "tenant-x", "Audit.General")
+	evs, err := normalizeRecord(map[string]interface{}{}, "tenant-x", "Audit.General")
 	if err != nil {
 		t.Fatalf("normalizeRecord with empty: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 	if ev.Source != "m365" {
 		t.Errorf("Source = %q, want m365", ev.Source)
+	}
+	if ev.Type != normalize.CatchAll {
+		t.Errorf("Type = %q, want %q", ev.Type, normalize.CatchAll)
 	}
 	if ev.Timestamp.IsZero() {
 		t.Error("Timestamp is zero")
@@ -152,13 +174,18 @@ func TestNormalizeRecordOperationOnly(t *testing.T) {
 		"UserId":       "bob@corp.com",
 	}
 
-	ev, err := normalizeRecord(raw, "tenant-op", "Audit.SharePoint")
+	evs, err := normalizeRecord(raw, "tenant-op", "Audit.SharePoint")
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
 	}
-	// No workload => type is just the operation.
-	if ev.Type != "FileUploaded" {
-		t.Errorf("Type = %q, want FileUploaded", ev.Type)
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
+	// FileUploaded is not a security-relevant mapped operation; it falls through
+	// to the inert catch-all type.
+	if ev.Type != normalize.CatchAll {
+		t.Errorf("Type = %q, want %q", ev.Type, normalize.CatchAll)
 	}
 }
 
@@ -171,10 +198,14 @@ func TestNormalizeRecordSchemaRoundtrip(t *testing.T) {
 		"UserId":       "charlie@company.com",
 	}
 
-	ev, err := normalizeRecord(raw, "tenant-roundtrip", "Audit.Exchange")
+	evs, err := normalizeRecord(raw, "tenant-roundtrip", "Audit.Exchange")
 	if err != nil {
 		t.Fatalf("normalizeRecord: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	b, err := json.Marshal(ev)
 	if err != nil {

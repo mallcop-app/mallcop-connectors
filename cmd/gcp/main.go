@@ -28,6 +28,7 @@ import (
 	"google.golang.org/api/logging/v2"
 	"google.golang.org/api/option"
 
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
@@ -90,32 +91,26 @@ func sha256Hex(s string) string {
 	return fmt.Sprintf("%x", h[:])
 }
 
-func normalizeLogEntry(entry *logging.LogEntry, projectID string) (*event.Event, error) {
-	payload, err := json.Marshal(entry)
-	if err != nil {
-		return nil, fmt.Errorf("marshal entry: %w", err)
+// normalizeLogEntry maps a raw GCP Cloud Audit Log entry to one or more mallcop
+// events. The canonical Type and detector-readable Payload come from the shared
+// normalize library (NOT the raw protoPayload.methodName, which gates no
+// detector). A SetIamPolicy granting a privileged role fans out to two events.
+func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Event, error) {
+	var proto map[string]interface{}
+	if entry.ProtoPayload != nil {
+		_ = json.Unmarshal(entry.ProtoPayload, &proto)
 	}
 
 	// Extract actor from protoPayload.authenticationInfo.principalEmail.
 	actor := ""
-	if entry.ProtoPayload != nil {
-		var proto map[string]interface{}
-		if err := json.Unmarshal(entry.ProtoPayload, &proto); err == nil {
-			if authInfo, ok := proto["authenticationInfo"].(map[string]interface{}); ok {
-				actor, _ = authInfo["principalEmail"].(string)
-			}
-		}
+	if authInfo, ok := proto["authenticationInfo"].(map[string]interface{}); ok {
+		actor, _ = authInfo["principalEmail"].(string)
 	}
 
-	// Extract method name (event type) from protoPayload.methodName.
-	eventType := entry.LogName
-	if entry.ProtoPayload != nil {
-		var proto map[string]interface{}
-		if err := json.Unmarshal(entry.ProtoPayload, &proto); err == nil {
-			if methodName, ok := proto["methodName"].(string); ok && methodName != "" {
-				eventType = methodName
-			}
-		}
+	// Extract method name for mapping; fall back to LogName when absent.
+	methodName := entry.LogName
+	if mn, ok := proto["methodName"].(string); ok && mn != "" {
+		methodName = mn
 	}
 
 	// Parse timestamp.
@@ -136,16 +131,30 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) (*event.Event,
 	if entry.InsertId != "" {
 		idSrc = "gcp:insertid:" + entry.InsertId
 	}
+	baseID := sha256Hex(idSrc)
 
-	return &event.Event{
-		ID:        sha256Hex(idSrc),
-		Source:    "gcp",
-		Type:      eventType,
-		Actor:     actor,
-		Timestamp: ts,
-		Org:       projectID,
-		Payload:   json.RawMessage(payload),
-	}, nil
+	results := normalize.GCP(methodName, proto)
+	out := make([]*event.Event, 0, len(results))
+	for i, r := range results {
+		payload, err := r.PayloadJSON(proto)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload: %w", err)
+		}
+		id := baseID
+		if i > 0 {
+			id = sha256Hex(fmt.Sprintf("%s:%d", idSrc, i))
+		}
+		out = append(out, &event.Event{
+			ID:        id,
+			Source:    "gcp",
+			Type:      r.Type,
+			Actor:     actor,
+			Timestamp: ts,
+			Org:       projectID,
+			Payload:   payload,
+		})
+	}
+	return out, nil
 }
 
 func newLoggingClient(ctx context.Context) (*logging.Service, error) {
@@ -203,12 +212,12 @@ func fetchAuditLogs(ctx context.Context, svc *logging.Service, projectID string,
 		}
 
 		for _, entry := range resp.Entries {
-			ev, err := normalizeLogEntry(entry, projectID)
+			evs, err := normalizeLogEntry(entry, projectID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
-			allEvents = append(allEvents, ev)
+			allEvents = append(allEvents, evs...)
 		}
 
 		if resp.NextPageToken == "" {

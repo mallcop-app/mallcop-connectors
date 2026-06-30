@@ -7,7 +7,8 @@
 //
 // Auth: M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET (OAuth2 client credentials).
 // Content types fetched: Audit.AzureActiveDirectory, Audit.Exchange,
-//                        Audit.SharePoint, Audit.General.
+//
+//	Audit.SharePoint, Audit.General.
 package main
 
 import (
@@ -28,13 +29,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
 const (
-	cursorMaxLen    = 2000
-	tokenEndpoint   = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"
-	managementBase  = "https://manage.office.com/api/v1.0/%s/activity/feed"
+	cursorMaxLen   = 2000
+	tokenEndpoint  = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"
+	managementBase = "https://manage.office.com/api/v1.0/%s/activity/feed"
 )
 
 var (
@@ -147,19 +149,18 @@ type auditRecord struct {
 	RecordType   int    `json:"RecordType"`
 }
 
-func normalizeRecord(raw map[string]interface{}, tenantID, contentType string) (*event.Event, error) {
-	payload, err := json.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("marshal record: %w", err)
-	}
-
+// normalizeRecord maps a raw O365 Management Activity record to one or more
+// mallcop events. The canonical Type and detector-readable Payload come from the
+// shared normalize library (NOT the raw Workload.Operation, which gates no
+// detector).
+func normalizeRecord(raw map[string]interface{}, tenantID, contentType string) ([]*event.Event, error) {
 	operation, _ := raw["Operation"].(string)
 	userID, _ := raw["UserId"].(string)
 	workload, _ := raw["Workload"].(string)
 
-	eventType := operation
+	rawType := operation
 	if workload != "" && operation != "" {
-		eventType = workload + "." + operation
+		rawType = workload + "." + operation
 	}
 
 	ts := time.Now().UTC()
@@ -176,20 +177,34 @@ func normalizeRecord(raw map[string]interface{}, tenantID, contentType string) (
 		ts = ts.UTC()
 	}
 
-	idSrc := fmt.Sprintf("m365:%s:%s:%d", tenantID, eventType, ts.UnixNano())
+	idSrc := fmt.Sprintf("m365:%s:%s:%d", tenantID, rawType, ts.UnixNano())
 	if id, ok := raw["Id"].(string); ok && id != "" {
 		idSrc = "m365:id:" + id
 	}
+	baseID := sha256Hex(idSrc)
 
-	return &event.Event{
-		ID:        sha256Hex(idSrc),
-		Source:    "m365",
-		Type:      eventType,
-		Actor:     userID,
-		Timestamp: ts,
-		Org:       tenantID,
-		Payload:   json.RawMessage(payload),
-	}, nil
+	results := normalize.M365(workload, operation, raw)
+	out := make([]*event.Event, 0, len(results))
+	for i, r := range results {
+		payload, err := r.PayloadJSON(raw)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload: %w", err)
+		}
+		id := baseID
+		if i > 0 {
+			id = sha256Hex(fmt.Sprintf("%s:%d", idSrc, i))
+		}
+		out = append(out, &event.Event{
+			ID:        id,
+			Source:    "m365",
+			Type:      r.Type,
+			Actor:     userID,
+			Timestamp: ts,
+			Org:       tenantID,
+			Payload:   payload,
+		})
+	}
+	return out, nil
 }
 
 type connector struct {
@@ -226,7 +241,7 @@ func (c *connector) authGet(ctx context.Context, rawURL string, params url.Value
 func (c *connector) ensureSubscription(ctx context.Context, contentType string) error {
 	endpoint := fmt.Sprintf("%s/subscriptions/start", fmt.Sprintf(managementBase, c.tenantID))
 	params := url.Values{
-		"contentType":  {contentType},
+		"contentType":         {contentType},
 		"PublisherIdentifier": {c.tenantID},
 	}
 
@@ -334,12 +349,12 @@ func (c *connector) fetchBlob(ctx context.Context, contentURI, contentType strin
 
 	var events []*event.Event
 	for _, record := range records {
-		ev, err := normalizeRecord(record, c.tenantID, contentType)
+		evs, err := normalizeRecord(record, c.tenantID, contentType)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warn: skipping record: %v\n", err)
 			continue
 		}
-		events = append(events, ev)
+		events = append(events, evs...)
 	}
 	return events, nil
 }

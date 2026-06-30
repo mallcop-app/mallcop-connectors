@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
@@ -132,19 +133,17 @@ type activityLogEntry struct {
 	} `json:"status"`
 }
 
-func normalizeEntry(entry map[string]interface{}, subscriptionID string) (*event.Event, error) {
-	payload, err := json.Marshal(entry)
-	if err != nil {
-		return nil, fmt.Errorf("marshal entry: %w", err)
-	}
-
+// normalizeEntry maps a raw Azure Activity Log entry to one or more mallcop
+// events. The canonical Type and detector-readable Payload come from the shared
+// normalize library (NOT the raw operationName, which gates no detector).
+func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*event.Event, error) {
 	// Extract caller (actor).
 	actor, _ := entry["caller"].(string)
 
-	// Extract operation name as event type.
-	eventType := ""
-	if opName, ok := entry["operationName"].(map[string]interface{}); ok {
-		eventType, _ = opName["value"].(string)
+	// Extract operation name for mapping.
+	opName := ""
+	if op, ok := entry["operationName"].(map[string]interface{}); ok {
+		opName, _ = op["value"].(string)
 	}
 
 	// Parse timestamp.
@@ -167,18 +166,32 @@ func normalizeEntry(entry map[string]interface{}, subscriptionID string) (*event
 	if id, ok := entry["id"].(string); ok && id != "" {
 		idStr = "azure:" + id
 	} else {
-		idStr = fmt.Sprintf("azure:%s:%s:%d", subscriptionID, eventType, ts.UnixNano())
+		idStr = fmt.Sprintf("azure:%s:%s:%d", subscriptionID, opName, ts.UnixNano())
 	}
+	baseID := sha256Hex(idStr)
 
-	return &event.Event{
-		ID:        sha256Hex(idStr),
-		Source:    "azure",
-		Type:      eventType,
-		Actor:     actor,
-		Timestamp: ts,
-		Org:       subscriptionID,
-		Payload:   json.RawMessage(payload),
-	}, nil
+	results := normalize.Azure(opName, entry)
+	out := make([]*event.Event, 0, len(results))
+	for i, r := range results {
+		payload, err := r.PayloadJSON(entry)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload: %w", err)
+		}
+		id := baseID
+		if i > 0 {
+			id = sha256Hex(fmt.Sprintf("%s:%d", idStr, i))
+		}
+		out = append(out, &event.Event{
+			ID:        id,
+			Source:    "azure",
+			Type:      r.Type,
+			Actor:     actor,
+			Timestamp: ts,
+			Org:       subscriptionID,
+			Payload:   payload,
+		})
+	}
+	return out, nil
 }
 
 type activityLogResponse struct {
@@ -243,12 +256,12 @@ func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, strin
 		resp.Body.Close()
 
 		for _, entry := range result.Value {
-			ev, err := normalizeEntry(entry, c.subscriptionID)
+			evs, err := normalizeEntry(entry, c.subscriptionID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
-			allEvents = append(allEvents, ev)
+			allEvents = append(allEvents, evs...)
 		}
 
 		if result.NextLink == "" {

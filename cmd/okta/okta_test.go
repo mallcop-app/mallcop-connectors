@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
 
@@ -100,9 +101,9 @@ func TestParseNextLink(t *testing.T) {
 
 func TestNormalizeOktaEvent(t *testing.T) {
 	raw := map[string]interface{}{
-		"uuid":        "abc123-def456",
-		"published":   "2024-06-01T12:00:00.000Z",
-		"eventType":   "user.session.start",
+		"uuid":           "abc123-def456",
+		"published":      "2024-06-01T12:00:00.000Z",
+		"eventType":      "user.session.start",
 		"displayMessage": "User login",
 		"actor": map[string]interface{}{
 			"id":          "00u1abc",
@@ -110,18 +111,41 @@ func TestNormalizeOktaEvent(t *testing.T) {
 			"alternateId": "alice@example.com",
 			"displayName": "Alice",
 		},
+		"client": map[string]interface{}{
+			"ipAddress": "198.51.100.9",
+			"geographicalContext": map[string]interface{}{
+				"country": "US",
+				"state":   "WA",
+			},
+		},
 	}
 
-	ev, err := normalizeOktaEvent(raw, "myorg.okta.com")
+	evs, err := normalizeOktaEvent(raw, "myorg.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	if ev.Source != "okta" {
 		t.Errorf("Source = %q, want okta", ev.Source)
 	}
-	if ev.Type != "user.session.start" {
-		t.Errorf("Type = %q, want user.session.start", ev.Type)
+	// The raw Okta eventType gates no detector; user.session.start maps to the
+	// canonical "login" type, with ip/geo promoted to the flat payload.
+	if ev.Type != "login" {
+		t.Errorf("Type = %q, want login", ev.Type)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if p["ip"] != "198.51.100.9" {
+		t.Errorf("payload ip = %v, want 198.51.100.9", p["ip"])
+	}
+	if p["geo"] != "US/WA" {
+		t.Errorf("payload geo = %v, want US/WA", p["geo"])
 	}
 	if ev.Actor != "alice@example.com" {
 		t.Errorf("Actor = %q, want alice@example.com", ev.Actor)
@@ -151,10 +175,14 @@ func TestNormalizeOktaEventActorFallback(t *testing.T) {
 		},
 	}
 
-	ev, err := normalizeOktaEvent(raw, "corp.okta.com")
+	evs, err := normalizeOktaEvent(raw, "corp.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	// alternateId is empty, should fall back to displayName.
 	if ev.Actor != "Bob Smith" {
@@ -163,12 +191,19 @@ func TestNormalizeOktaEventActorFallback(t *testing.T) {
 }
 
 func TestNormalizeOktaEventMissingFields(t *testing.T) {
-	ev, err := normalizeOktaEvent(map[string]interface{}{}, "empty.okta.com")
+	evs, err := normalizeOktaEvent(map[string]interface{}{}, "empty.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent with empty map: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 	if ev.Source != "okta" {
 		t.Errorf("Source = %q, want okta", ev.Source)
+	}
+	if ev.Type != normalize.CatchAll {
+		t.Errorf("Type = %q, want %q", ev.Type, normalize.CatchAll)
 	}
 	if ev.Timestamp.IsZero() {
 		t.Error("Timestamp is zero")
@@ -182,10 +217,14 @@ func TestNormalizeOktaEventSchemaRoundtrip(t *testing.T) {
 		"eventType": "policy.lifecycle.update",
 	}
 
-	ev, err := normalizeOktaEvent(raw, "org.okta.com")
+	evs, err := normalizeOktaEvent(raw, "org.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
+	if len(evs) != 1 {
+		t.Fatalf("want 1 event, got %d", len(evs))
+	}
+	ev := evs[0]
 
 	b, err := json.Marshal(ev)
 	if err != nil {
