@@ -18,7 +18,7 @@ Grant the service account the `roles/logging.viewer` role on the target project 
 ## Usage
 
 ```bash
-gcp --project <project-id> [--since <iso-timestamp>] [--cursor <cursor>]
+mallcop-connector-gcp --project <project-id> [--since <iso-timestamp>] [--cursor <cursor>]
 ```
 
 ## Sample output

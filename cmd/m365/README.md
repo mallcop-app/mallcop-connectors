@@ -25,7 +25,7 @@ Grant admin consent after adding.
 ## Usage
 
 ```bash
-m365 [--since <iso-timestamp>] [--cursor <cursor>]
+mallcop-connector-m365 [--since <iso-timestamp>] [--cursor <cursor>]
 ```
 
 ## Sample output

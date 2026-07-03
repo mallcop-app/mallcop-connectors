@@ -20,7 +20,7 @@ Assign the built-in **Reader** role (or a custom role with `microsoft.insights/e
 ## Usage
 
 ```bash
-azure --subscription-id <id> [--since <iso-timestamp>] [--cursor <cursor>]
+mallcop-connector-azure --subscription-id <id> [--since <iso-timestamp>] [--cursor <cursor>]
 ```
 
 ## Sample output

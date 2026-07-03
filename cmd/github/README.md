@@ -21,7 +21,7 @@ Alternatively, pass a pre-minted installation access token via `--installation-t
 ## Usage
 
 ```bash
-github \
+mallcop-connector-github \
   --app-id 12345 \
   --installation-id 67890 \
   --private-key-path /path/to/private-key.pem \

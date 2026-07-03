@@ -27,7 +27,7 @@ AWS profiles (`~/.aws/credentials`) and instance/pod roles are also supported vi
 ## Usage
 
 ```bash
-aws --region us-east-1 [--since <iso-timestamp>] [--cursor <cursor>]
+mallcop-connector-aws --region us-east-1 [--since <iso-timestamp>] [--cursor <cursor>]
 ```
 
 ## Sample output
