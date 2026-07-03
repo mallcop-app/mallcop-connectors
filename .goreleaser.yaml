@@ -1,0 +1,52 @@
+# goreleaser config — release the connectors as namespaced binaries.
+#
+# Each cmd/<source> package builds to `mallcop-connector-<source>` so release
+# artifacts do not collide with the real vendor CLIs (bare `aws`, `gcp`, ...).
+# The Go source and the stdout JSONL + --since/--cursor contract are unchanged;
+# only the emitted binary name is namespaced.
+version: 2
+
+builds:
+  - id: aws
+    main: ./cmd/aws
+    binary: mallcop-connector-aws
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+  - id: azure
+    main: ./cmd/azure
+    binary: mallcop-connector-azure
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+  - id: gcp
+    main: ./cmd/gcp
+    binary: mallcop-connector-gcp
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+  - id: github
+    main: ./cmd/github
+    binary: mallcop-connector-github
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+  - id: m365
+    main: ./cmd/m365
+    binary: mallcop-connector-m365
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+  - id: okta
+    main: ./cmd/okta
+    binary: mallcop-connector-okta
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: connectors
+    name_template: "{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"

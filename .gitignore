@@ -21,13 +21,15 @@ vendor/
 # Build output
 /dist/
 /bin/
-# Stray connector binaries built into the repo root
+# Stray connector binaries built into the repo root (bare `go build ./cmd/...`)
 /github
 /aws
 /azure
 /gcp
 /m365
 /okta
+# Namespaced connector binaries if built into the repo root
+/mallcop-connector-*
 
 # IDE
 .idea/

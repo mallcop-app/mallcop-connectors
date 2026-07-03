@@ -18,7 +18,7 @@ The API token must belong to a user (or service account) with at least the **Rea
 ## Usage
 
 ```bash
-okta [--since <iso-timestamp>] [--cursor <cursor>]
+mallcop-connector-okta [--since <iso-timestamp>] [--cursor <cursor>]
 ```
 
 ## Sample output

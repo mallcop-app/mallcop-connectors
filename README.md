@@ -4,14 +4,18 @@
 
 ## Connectors
 
-| Connector | Service | Auth | Status |
-|---|---|---|---|
-| `aws` | AWS CloudTrail | aws-sdk-go-v2 (env/profile) | stable |
-| `azure` | Azure Activity Log | Service principal (OAuth2) | stable |
-| `gcp` | GCP Cloud Logging | Service account JSON | stable |
-| `github` | GitHub Audit Log | GitHub App installation | stable |
-| `m365` | Office 365 Management Activity API | App registration | stable |
-| `okta` | Okta System Log | SSWS token | stable |
+Each connector installs as `mallcop-connector-<source>` — namespaced so the
+binaries never collide with the real vendor CLIs (`aws`, `gcp`, `okta`, ...)
+already on your `$PATH`.
+
+| Binary | Source | Service | Auth | Status |
+|---|---|---|---|---|
+| `mallcop-connector-aws` | `aws` | AWS CloudTrail | aws-sdk-go-v2 (env/profile) | stable |
+| `mallcop-connector-azure` | `azure` | Azure Activity Log | Service principal (OAuth2) | stable |
+| `mallcop-connector-gcp` | `gcp` | GCP Cloud Logging | Service account JSON | stable |
+| `mallcop-connector-github` | `github` | GitHub Audit Log | GitHub App installation | stable |
+| `mallcop-connector-m365` | `m365` | Office 365 Management Activity API | App registration | stable |
+| `mallcop-connector-okta` | `okta` | Okta System Log | SSWS token | stable |
 
 Each connector:
 - Talks to the real upstream API (no mocks at runtime).
@@ -21,16 +25,46 @@ Each connector:
 
 ## Install
 
+The connectors ship with the vendor namespace (`mallcop-connector-<source>`).
+This is a **build-output rename only** — the Go source, flags, and stdout JSONL
+contract are unchanged (`go build -o mallcop-connector-<source> ./cmd/<source>`).
+
+### Makefile / install.sh (recommended)
+
 ```bash
-go install github.com/mallcop-app/mallcop-connectors/cmd/aws@v0.6.0
-go install github.com/mallcop-app/mallcop-connectors/cmd/azure@v0.6.0
-go install github.com/mallcop-app/mallcop-connectors/cmd/gcp@v0.6.0
-go install github.com/mallcop-app/mallcop-connectors/cmd/github@v0.6.0
-go install github.com/mallcop-app/mallcop-connectors/cmd/m365@v0.6.0
-go install github.com/mallcop-app/mallcop-connectors/cmd/okta@v0.6.0
+make install                     # build + install to /usr/local/bin
+make install PREFIX=$HOME/.local # install to $HOME/.local/bin
+make build                       # build to ./dist only
+make list                        # print the installed binary names
+
+# or, without make:
+./install.sh                     # build + install to /usr/local/bin
+PREFIX=$HOME/.local ./install.sh # install to $HOME/.local/bin
+DISTONLY=1 ./install.sh          # build to ./dist only
 ```
 
-Or download platform binaries from the [v0.6.0 release page](https://github.com/mallcop-app/mallcop-connectors/releases/tag/v0.6.0).
+### Plain `go build` (single connector)
+
+`go build`/`go install` name a binary after its `cmd/<source>` directory (bare
+`aws`, `gcp`, ...), which collides with the vendor CLIs. Build with an explicit
+`-o` to get the namespaced name:
+
+```bash
+go build -o mallcop-connector-aws ./cmd/aws
+# then move it onto your $PATH, e.g.
+install -m 0755 mallcop-connector-aws /usr/local/bin/
+```
+
+### Release binaries
+
+Pre-built, namespaced binaries for each platform are published on the
+[releases page](https://github.com/mallcop-app/mallcop-connectors/releases)
+(built via `.goreleaser.yaml`).
+
+> **Note on `go install ...@latest`:** it emits a bare, unnamespaced binary
+> (`aws`, `gcp`, ...) named after the `cmd/` directory, so it is **not**
+> recommended — it will shadow or be shadowed by the vendor CLIs. Use the
+> Makefile, `install.sh`, or the release binaries above.
 
 ## Quickstart
 
@@ -40,7 +74,7 @@ Or download platform binaries from the [v0.6.0 release page](https://github.com/
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1          # or --region flag
-aws --region us-east-1 --since 2024-01-01T00:00:00Z
+mallcop-connector-aws --region us-east-1 --since 2024-01-01T00:00:00Z
 ```
 
 ### azure
@@ -50,7 +84,7 @@ export AZURE_TENANT_ID=...
 export AZURE_CLIENT_ID=...
 export AZURE_CLIENT_SECRET=...
 export AZURE_SUBSCRIPTION_ID=...     # or --subscription-id flag
-azure --subscription-id <id> --since 2024-01-01T00:00:00Z
+mallcop-connector-azure --subscription-id <id> --since 2024-01-01T00:00:00Z
 ```
 
 ### gcp
@@ -58,13 +92,13 @@ azure --subscription-id <id> --since 2024-01-01T00:00:00Z
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
 export GCP_PROJECT_ID=my-project     # or --project flag
-gcp --project my-project --since 2024-01-01T00:00:00Z
+mallcop-connector-gcp --project my-project --since 2024-01-01T00:00:00Z
 ```
 
 ### github
 
 ```bash
-github \
+mallcop-connector-github \
   --app-id 12345 \
   --installation-id 67890 \
   --private-key-path /path/to/private-key.pem \
@@ -78,7 +112,7 @@ github \
 export M365_TENANT_ID=...
 export M365_CLIENT_ID=...
 export M365_CLIENT_SECRET=...
-m365 --since 2024-01-01T00:00:00Z
+mallcop-connector-m365 --since 2024-01-01T00:00:00Z
 ```
 
 ### okta
@@ -86,7 +120,7 @@ m365 --since 2024-01-01T00:00:00Z
 ```bash
 export OKTA_DOMAIN=myorg.okta.com
 export OKTA_API_TOKEN=...
-okta --since 2024-01-01T00:00:00Z
+mallcop-connector-okta --since 2024-01-01T00:00:00Z
 ```
 
 ## Output format
@@ -108,8 +142,8 @@ Connector auth is env-driven. See [`cmd/<name>/README.md`](cmd/) for the specifi
 All connectors accept a `--cursor` flag. On success, the last cursor value is printed to stderr. Pass it back on the next run to resume without duplicates:
 
 ```bash
-aws --region us-east-1 2>cursor.txt | mallcop scan
-aws --region us-east-1 --cursor "$(cat cursor.txt)"
+mallcop-connector-aws --region us-east-1 2>cursor.txt | mallcop scan
+mallcop-connector-aws --region us-east-1 --cursor "$(cat cursor.txt)"
 ```
 
 ## Migrating from Python mallcop connectors
