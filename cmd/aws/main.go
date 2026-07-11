@@ -186,11 +186,16 @@ func fetchEvents(ctx context.Context, client *cloudtrail.Client, region string, 
 
 func run() error {
 	var (
-		region    = flag.String("region", "", "AWS region (overrides AWS_REGION env var)")
-		since     = flag.String("since", "", "ISO 8601 timestamp to filter events (e.g. 2024-01-01T00:00:00Z)")
-		cursorArg = flag.String("cursor", "", "Checkpoint cursor from previous run (HMAC-signed)")
+		region      = flag.String("region", "", "AWS region (overrides AWS_REGION env var)")
+		since       = flag.String("since", "", "ISO 8601 timestamp to filter events (e.g. 2024-01-01T00:00:00Z)")
+		cursorArg   = flag.String("cursor", "", "Checkpoint cursor from previous run (HMAC-signed)")
+		trailBucket = flag.String("trail-bucket", "", "S3 bucket holding an org CloudTrail trail (overrides AWS_TRAIL_BUCKET); enables S3 org-trail mode")
 	)
 	flag.Parse()
+
+	if bucket := resolveTrailBucket(*trailBucket); bucket != "" {
+		return runS3(bucket, *since, *cursorArg)
+	}
 
 	awsRegion := *region
 	if awsRegion == "" {
