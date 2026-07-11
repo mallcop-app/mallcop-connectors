@@ -23,6 +23,10 @@ Each connector:
 - Normalizes output to mallcop's `event.Event` JSONL shape.
 - Is independently installable and pipeable.
 
+> **Connecting a source to a scan?** See the **[Connector Setup Guide](docs/connector-setup.md)** —
+> the exact read-only credentials each connector needs, how to provision them, the
+> `mallcop.yaml` block, and the CI wiring, per source (GitHub · Azure · AWS · M365 · GCP · Okta).
+
 ## Install
 
 The connectors ship with the vendor namespace (`mallcop-connector-<source>`).
