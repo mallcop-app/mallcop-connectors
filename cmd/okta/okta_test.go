@@ -123,7 +123,7 @@ func TestNormalizeOktaEvent(t *testing.T) {
 		},
 	}
 
-	evs, err := normalizeOktaEvent(raw, "myorg.okta.com")
+	evs, tsReliable, err := normalizeOktaEvent(raw, "myorg.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
@@ -134,6 +134,9 @@ func TestNormalizeOktaEvent(t *testing.T) {
 
 	if ev.Source != "okta" {
 		t.Errorf("Source = %q, want okta", ev.Source)
+	}
+	if !tsReliable {
+		t.Error("tsReliable = false, want true when published is present and parseable")
 	}
 	// The raw Okta eventType gates no detector; user.session.start maps to the
 	// canonical "login" type, with ip/geo promoted to the flat payload.
@@ -178,7 +181,7 @@ func TestNormalizeOktaEventActorFallback(t *testing.T) {
 		},
 	}
 
-	evs, err := normalizeOktaEvent(raw, "corp.okta.com")
+	evs, _, err := normalizeOktaEvent(raw, "corp.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
@@ -194,7 +197,7 @@ func TestNormalizeOktaEventActorFallback(t *testing.T) {
 }
 
 func TestNormalizeOktaEventMissingFields(t *testing.T) {
-	evs, err := normalizeOktaEvent(map[string]interface{}{}, "empty.okta.com")
+	evs, tsReliable, err := normalizeOktaEvent(map[string]interface{}{}, "empty.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent with empty map: %v", err)
 	}
@@ -211,6 +214,12 @@ func TestNormalizeOktaEventMissingFields(t *testing.T) {
 	if ev.Timestamp.IsZero() {
 		t.Error("Timestamp is zero")
 	}
+	// The fabricated fallback timestamp must never be reported as reliable —
+	// the caller (fetchSystemLog) must not let it advance the resume
+	// high-water mark.
+	if tsReliable {
+		t.Error("tsReliable = true, want false when published is missing (would poison the resume cursor to wall-clock now)")
+	}
 }
 
 func TestNormalizeOktaEventSchemaRoundtrip(t *testing.T) {
@@ -220,7 +229,7 @@ func TestNormalizeOktaEventSchemaRoundtrip(t *testing.T) {
 		"eventType": "policy.lifecycle.update",
 	}
 
-	evs, err := normalizeOktaEvent(raw, "org.okta.com")
+	evs, _, err := normalizeOktaEvent(raw, "org.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
@@ -304,6 +313,36 @@ func TestFetchSystemLogCompletePaginationHighWaterCursor(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339Nano, decoded); err != nil {
 		t.Fatalf("cursor payload is not a timestamp (looks like a polling link): %v", err)
+	}
+}
+
+// (a2) a page mixing a good-timestamp entry with a missing-published entry
+// must advance maxSeen to the good entry's time, NOT to the fabricated
+// time.Now() fallback used for the missing-timestamp entry's own Timestamp
+// field. Regression test for the high-water cursor poisoning bug.
+func TestFetchSystemLogMissingTimestampDoesNotPoisonMaxSeen(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]interface{}{
+			{"uuid": "e1", "eventType": "user.session.start", "published": "2024-06-01T12:00:00.000Z"},
+			// No published: normalizeOktaEvent falls back to
+			// time.Now().UTC(), which is always AFTER the good entry.
+			{"uuid": "e2", "eventType": "user.session.start"},
+		})
+	}))
+	defer srv.Close()
+
+	conn := &connector{client: srv.Client(), domain: testDomain(srv.URL), apiToken: "tok"}
+	events, maxSeen, err := conn.fetchSystemLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchSystemLog: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events emitted (both, even the unreliable one), got %d", len(events))
+	}
+	want := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	if !maxSeen.Equal(want) {
+		t.Fatalf("maxSeen = %v, want %v (the fabricated now() timestamp on the missing-published entry must not advance the cursor)", maxSeen, want)
 	}
 }
 

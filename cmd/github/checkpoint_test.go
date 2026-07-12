@@ -186,6 +186,37 @@ func TestFetchAuditLogCompletePaginationHighWaterCursor(t *testing.T) {
 	}
 }
 
+// (a2) a page mixing a good-timestamp entry with a missing-created_at entry
+// must advance maxSeen to the good entry's time, NOT to the fabricated
+// time.Now() fallback used for the missing-timestamp entry's own Timestamp
+// field. Regression test for the high-water cursor poisoning bug.
+func TestFetchAuditLogMissingTimestampDoesNotPoisonMaxSeen(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]interface{}{
+			{"action": "repo.create", "actor": "alice", "created_at": "2024-06-01T12:00:00Z", "_document_id": "d1"},
+			// No created_at: normalizeEntry falls back to time.Now().UTC(),
+			// which is always AFTER the good entry.
+			{"action": "repo.destroy", "actor": "bob", "_document_id": "d2"},
+		})
+	}))
+	defer srv.Close()
+	defer apiBaseOverride(srv.URL)()
+
+	conn := &connector{client: srv.Client(), org: "testorg"}
+	events, maxSeen, err := conn.fetchAuditLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchAuditLog: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events emitted (both, even the unreliable one), got %d", len(events))
+	}
+	want := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	if !maxSeen.Equal(want) {
+		t.Fatalf("maxSeen = %v, want %v (the fabricated now() timestamp on the missing-created_at entry must not advance the cursor)", maxSeen, want)
+	}
+}
+
 // (b) resume with a timestamp cursor queries from that timestamp inclusively
 // via the CLIENT-SIDE newest-first early-stop: assert the actual early-stop
 // boundary reflects T, INCLUSIVE (an entry exactly at the floor is kept, and

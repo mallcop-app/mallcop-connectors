@@ -132,7 +132,17 @@ func resolveFloor(cursorArg string, sinceTime time.Time, key []byte) (floor time
 // events. The canonical Type and detector-readable Payload come from the shared
 // normalize library (NOT the raw protoPayload.methodName, which gates no
 // detector). A SetIamPolicy granting a privileged role fans out to two events.
-func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Event, error) {
+//
+// The second return value, tsReliable, is true only when the Timestamp on the
+// returned events came from the entry's own Timestamp field. When Timestamp
+// is missing or unparseable, ts falls back to time.Now().UTC() so the event
+// still has SOME timestamp for display/dedupe purposes — but that fabricated
+// value must never be allowed to advance the resume high-water mark (it
+// would silently poison the cursor to "now" and cause the next run to skip
+// every real event between the true high-water mark and now). Callers must
+// gate maxSeen updates on tsReliable, not merely on ev.Timestamp being
+// non-zero.
+func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Event, bool, error) {
 	var proto map[string]interface{}
 	if entry.ProtoPayload != nil {
 		_ = json.Unmarshal(entry.ProtoPayload, &proto)
@@ -152,6 +162,7 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 
 	// Parse timestamp.
 	ts := time.Now().UTC()
+	tsReliable := false
 	if entry.Timestamp != "" {
 		var err error
 		ts, err = time.Parse(time.RFC3339Nano, entry.Timestamp)
@@ -160,7 +171,11 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 			if err != nil {
 				log.Printf("warn: failed to parse timestamp %q: %v", entry.Timestamp, err)
 				ts = time.Now().UTC()
+			} else {
+				tsReliable = true
 			}
+		} else {
+			tsReliable = true
 		}
 	}
 
@@ -175,7 +190,7 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 	for i, r := range results {
 		payload, err := r.PayloadJSON(proto)
 		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
+			return nil, false, fmt.Errorf("marshal payload: %w", err)
 		}
 		id := baseID
 		if i > 0 {
@@ -191,7 +206,7 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 			Payload:   payload,
 		})
 	}
-	return out, nil
+	return out, tsReliable, nil
 }
 
 func newLoggingClient(ctx context.Context) (*logging.Service, error) {
@@ -256,15 +271,22 @@ func fetchAuditLogs(ctx context.Context, svc *logging.Service, projectID string,
 		}
 
 		for _, entry := range resp.Entries {
-			evs, err := normalizeLogEntry(entry, projectID)
+			evs, tsReliable, err := normalizeLogEntry(entry, projectID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
 			allEvents = append(allEvents, evs...)
-			for _, ev := range evs {
-				if ev.Timestamp.After(maxSeen) {
-					maxSeen = ev.Timestamp
+			// Only a real source timestamp may advance the resume high-water
+			// mark. A fabricated time.Now() fallback (missing/unparseable
+			// Timestamp) must never poison maxSeen to "now" — that would
+			// silently skip every real event between the true high-water
+			// mark and now on the next run.
+			if tsReliable {
+				for _, ev := range evs {
+					if ev.Timestamp.After(maxSeen) {
+						maxSeen = ev.Timestamp
+					}
 				}
 			}
 		}

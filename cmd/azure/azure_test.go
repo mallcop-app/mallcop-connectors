@@ -91,7 +91,7 @@ func TestNormalizeEntry(t *testing.T) {
 		},
 	}
 
-	evs, err := normalizeEntry(entry, "sub-123")
+	evs, tsReliable, err := normalizeEntry(entry, "sub-123")
 	if err != nil {
 		t.Fatalf("normalizeEntry: %v", err)
 	}
@@ -102,6 +102,9 @@ func TestNormalizeEntry(t *testing.T) {
 
 	if ev.Source != "azure" {
 		t.Errorf("Source = %q, want azure", ev.Source)
+	}
+	if !tsReliable {
+		t.Error("tsReliable = false, want true when eventTimestamp is present and parseable")
 	}
 	// The raw operationName gates no detector; it MUST map to canonical
 	// "role_assignment" for the priv-escalation detector to fire.
@@ -139,7 +142,7 @@ func TestNormalizeEntry(t *testing.T) {
 
 func TestNormalizeEntryMissingFields(t *testing.T) {
 	entry := map[string]interface{}{}
-	evs, err := normalizeEntry(entry, "sub-xyz")
+	evs, tsReliable, err := normalizeEntry(entry, "sub-xyz")
 	if err != nil {
 		t.Fatalf("normalizeEntry with empty entry: %v", err)
 	}
@@ -157,6 +160,12 @@ func TestNormalizeEntryMissingFields(t *testing.T) {
 	if ev.Timestamp.IsZero() {
 		t.Error("Timestamp is zero")
 	}
+	// The fabricated fallback timestamp must never be reported as reliable —
+	// the caller (fetchActivityLog) must not let it advance the resume
+	// high-water mark.
+	if tsReliable {
+		t.Error("tsReliable = true, want false when eventTimestamp is missing (would poison the resume cursor to wall-clock now)")
+	}
 }
 
 func TestNormalizeEntrySchemaRoundtrip(t *testing.T) {
@@ -169,7 +178,7 @@ func TestNormalizeEntrySchemaRoundtrip(t *testing.T) {
 		"eventTimestamp": "2024-01-15T08:30:00Z",
 	}
 
-	evs, err := normalizeEntry(entry, "sub-roundtrip")
+	evs, _, err := normalizeEntry(entry, "sub-roundtrip")
 	if err != nil {
 		t.Fatalf("normalizeEntry: %v", err)
 	}
@@ -256,6 +265,35 @@ func TestFetchActivityLogCompletePaginationHighWaterCursor(t *testing.T) {
 	}
 	if !parsed.Equal(want) {
 		t.Errorf("cursor payload = %v, want %v", parsed, want)
+	}
+}
+
+// (a2) a page mixing a good-timestamp entry with a missing-eventTimestamp
+// entry must advance maxSeen to the good entry's time, NOT to the fabricated
+// time.Now() fallback used for the missing-timestamp entry's own Timestamp
+// field. Regression test for the high-water cursor poisoning bug.
+func TestFetchActivityLogMissingTimestampDoesNotPoisonMaxSeen(t *testing.T) {
+	page := []map[string]interface{}{
+		{"id": "1", "eventTimestamp": "2024-06-01T12:00:00Z", "caller": "a@example.com"},
+		// No eventTimestamp: normalizeEntry falls back to time.Now().UTC(),
+		// which is always AFTER the good entry's timestamp.
+		{"id": "2", "caller": "b@example.com"},
+	}
+	srv := serveActivityLogPages(t, [][]map[string]interface{}{page})
+	defer srv.Close()
+	defer activityLogBaseOverride(srv.URL)()
+
+	conn := &connector{client: srv.Client(), accessToken: "tok", subscriptionID: "sub-hw"}
+	events, maxSeen, err := conn.fetchActivityLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchActivityLog: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events emitted (both, even the unreliable one), got %d", len(events))
+	}
+	want := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	if !maxSeen.Equal(want) {
+		t.Fatalf("maxSeen = %v, want %v (the fabricated now() timestamp on the missing-eventTimestamp entry must not advance the cursor)", maxSeen, want)
 	}
 }
 

@@ -129,14 +129,23 @@ func resolveFloor(cursorArg string, sinceTime time.Time, key []byte) (floor time
 // canonical Type and detector-readable Payload come from the shared normalize
 // library (NOT the raw CloudTrail eventName, which gates no detector). A single
 // raw event may map to multiple canonical events.
-func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
+//
+// The second return value, tsReliable, is true only when the Timestamp on the
+// returned events came from CloudTrail's own EventTime field. When EventTime
+// is missing, ts falls back to time.Now().UTC() so the event still has SOME
+// timestamp for display/dedupe purposes — but that fabricated value must
+// never be allowed to advance the resume high-water mark (it would silently
+// poison the cursor to "now" and cause the next run to skip every real event
+// between the true high-water mark and now). Callers must gate maxSeen
+// updates on tsReliable, not merely on ev.Timestamp being non-zero.
+func normalizeEvent(e types.Event, region string) ([]*event.Event, bool, error) {
 	rawJSON, err := json.Marshal(e)
 	if err != nil {
-		return nil, fmt.Errorf("marshal event: %w", err)
+		return nil, false, fmt.Errorf("marshal event: %w", err)
 	}
 	var rawMap map[string]any
 	if err := json.Unmarshal(rawJSON, &rawMap); err != nil {
-		return nil, fmt.Errorf("decode event: %w", err)
+		return nil, false, fmt.Errorf("decode event: %w", err)
 	}
 
 	actor := ""
@@ -150,8 +159,10 @@ func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
 	}
 
 	ts := time.Now().UTC()
+	tsReliable := false
 	if e.EventTime != nil {
 		ts = e.EventTime.UTC()
+		tsReliable = true
 	}
 
 	idSrc := fmt.Sprintf("aws:cloudtrail:%s:%d", region, ts.UnixNano())
@@ -165,7 +176,7 @@ func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
 	for i, r := range results {
 		payload, err := r.PayloadJSON(rawMap)
 		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
+			return nil, false, fmt.Errorf("marshal payload: %w", err)
 		}
 		id := baseID
 		if i > 0 {
@@ -181,7 +192,7 @@ func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
 			Payload:   payload,
 		})
 	}
-	return out, nil
+	return out, tsReliable, nil
 }
 
 // cloudtrailAPI is the subset of *cloudtrail.Client used by LookupEvents
@@ -217,15 +228,22 @@ func fetchEvents(ctx context.Context, client cloudtrailAPI, region string, floor
 		}
 
 		for _, e := range out.Events {
-			evs, err := normalizeEvent(e, region)
+			evs, tsReliable, err := normalizeEvent(e, region)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping event: %v\n", err)
 				continue
 			}
 			allEvents = append(allEvents, evs...)
-			for _, ev := range evs {
-				if ev.Timestamp.After(maxSeen) {
-					maxSeen = ev.Timestamp
+			// Only a real source timestamp may advance the resume high-water
+			// mark. A fabricated time.Now() fallback (missing/unparseable
+			// EventTime) must never poison maxSeen to "now" — that would
+			// silently skip every real event between the true high-water
+			// mark and now on the next run.
+			if tsReliable {
+				for _, ev := range evs {
+					if ev.Timestamp.After(maxSeen) {
+						maxSeen = ev.Timestamp
+					}
 				}
 			}
 		}

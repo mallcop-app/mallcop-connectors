@@ -176,7 +176,17 @@ type activityLogEntry struct {
 // normalizeEntry maps a raw Azure Activity Log entry to one or more mallcop
 // events. The canonical Type and detector-readable Payload come from the shared
 // normalize library (NOT the raw operationName, which gates no detector).
-func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*event.Event, error) {
+//
+// The second return value, tsReliable, is true only when the Timestamp on the
+// returned events came from the entry's own eventTimestamp field. When
+// eventTimestamp is missing or unparseable, ts falls back to time.Now().UTC()
+// so the event still has SOME timestamp for display/dedupe purposes — but
+// that fabricated value must never be allowed to advance the resume
+// high-water mark (it would silently poison the cursor to "now" and cause
+// the next run to skip every real event between the true high-water mark and
+// now). Callers must gate maxSeen updates on tsReliable, not merely on
+// ev.Timestamp being non-zero.
+func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*event.Event, bool, error) {
 	// Extract caller (actor).
 	actor, _ := entry["caller"].(string)
 
@@ -188,6 +198,7 @@ func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*eve
 
 	// Parse timestamp.
 	ts := time.Now().UTC()
+	tsReliable := false
 	if tsStr, ok := entry["eventTimestamp"].(string); ok && tsStr != "" {
 		var err error
 		ts, err = time.Parse(time.RFC3339, tsStr)
@@ -197,7 +208,11 @@ func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*eve
 			if err != nil {
 				log.Printf("warn: failed to parse eventTimestamp %q: %v", tsStr, err)
 				ts = time.Now().UTC()
+			} else {
+				tsReliable = true
 			}
+		} else {
+			tsReliable = true
 		}
 	}
 
@@ -215,7 +230,7 @@ func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*eve
 	for i, r := range results {
 		payload, err := r.PayloadJSON(entry)
 		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
+			return nil, false, fmt.Errorf("marshal payload: %w", err)
 		}
 		id := baseID
 		if i > 0 {
@@ -231,7 +246,7 @@ func normalizeEntry(entry map[string]interface{}, subscriptionID string) ([]*eve
 			Payload:   payload,
 		})
 	}
-	return out, nil
+	return out, tsReliable, nil
 }
 
 type activityLogResponse struct {
@@ -300,15 +315,22 @@ func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, time.
 		resp.Body.Close()
 
 		for _, entry := range result.Value {
-			evs, err := normalizeEntry(entry, c.subscriptionID)
+			evs, tsReliable, err := normalizeEntry(entry, c.subscriptionID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
 			allEvents = append(allEvents, evs...)
-			for _, ev := range evs {
-				if ev.Timestamp.After(maxSeen) {
-					maxSeen = ev.Timestamp
+			// Only a real source timestamp may advance the resume high-water
+			// mark. A fabricated time.Now() fallback (missing/unparseable
+			// eventTimestamp) must never poison maxSeen to "now" — that would
+			// silently skip every real event between the true high-water
+			// mark and now on the next run.
+			if tsReliable {
+				for _, ev := range evs {
+					if ev.Timestamp.After(maxSeen) {
+						maxSeen = ev.Timestamp
+					}
 				}
 			}
 		}

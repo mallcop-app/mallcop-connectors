@@ -22,7 +22,7 @@ func TestNormalizeEntryMalformedTimestamp(t *testing.T) {
 		"created_at": "not-a-valid-timestamp",
 	}
 
-	ev, err := normalizeEntry(entry, "test-org")
+	ev, tsReliable, err := normalizeEntry(entry, "test-org")
 	if err != nil {
 		t.Fatalf("normalizeEntry: unexpected error: %v", err)
 	}
@@ -30,6 +30,13 @@ func TestNormalizeEntryMalformedTimestamp(t *testing.T) {
 	// Verify event was created
 	if ev == nil {
 		t.Fatal("expected non-nil event")
+	}
+
+	// The fabricated fallback timestamp must never be reported as reliable —
+	// the caller (fetchAuditLog) must not let it advance the resume
+	// high-water mark.
+	if tsReliable {
+		t.Error("tsReliable = true, want false for an unparseable created_at (would poison the resume cursor to wall-clock now)")
 	}
 
 	// Verify log output contains warning
@@ -65,7 +72,7 @@ func TestNormalizeEntryValidTimestamp(t *testing.T) {
 		"created_at": validTS,
 	}
 
-	ev, err := normalizeEntry(entry, "test-org")
+	ev, tsReliable, err := normalizeEntry(entry, "test-org")
 	if err != nil {
 		t.Fatalf("normalizeEntry: unexpected error: %v", err)
 	}
@@ -80,6 +87,9 @@ func TestNormalizeEntryValidTimestamp(t *testing.T) {
 	expectedTS, _ := time.Parse(time.RFC3339, validTS)
 	if !ev.Timestamp.Equal(expectedTS) {
 		t.Errorf("timestamp mismatch: got %v, want %v", ev.Timestamp, expectedTS)
+	}
+	if !tsReliable {
+		t.Error("tsReliable = false, want true when created_at is present and parseable")
 	}
 }
 

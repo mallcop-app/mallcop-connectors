@@ -109,10 +109,20 @@ func sigKey(appID, installationID int64) []byte {
 type auditLogEntry map[string]interface{}
 
 // normalizeEntry maps a raw audit log entry to a mallcop Event.
-func normalizeEntry(entry auditLogEntry, org string) (*event.Event, error) {
+//
+// The second return value, tsReliable, is true only when the Timestamp on
+// the returned event came from the entry's own created_at field. When
+// created_at is missing or unparseable, ts falls back to time.Now().UTC() so
+// the event still has SOME timestamp for display/dedupe purposes — but that
+// fabricated value must never be allowed to advance the resume high-water
+// mark (it would silently poison the cursor to "now" and cause the next run
+// to skip every real event between the true high-water mark and now).
+// Callers must gate maxSeen updates on tsReliable, not merely on
+// ev.Timestamp being non-zero.
+func normalizeEntry(entry auditLogEntry, org string) (*event.Event, bool, error) {
 	payload, err := json.Marshal(entry)
 	if err != nil {
-		return nil, fmt.Errorf("marshal entry: %w", err)
+		return nil, false, fmt.Errorf("marshal entry: %w", err)
 	}
 
 	// Extract fields.
@@ -123,20 +133,25 @@ func normalizeEntry(entry auditLogEntry, org string) (*event.Event, error) {
 	}
 
 	var ts time.Time
+	tsReliable := false
 	if createdAt, ok := entry["created_at"]; ok {
 		switch v := createdAt.(type) {
 		case float64:
 			ts = time.UnixMilli(int64(v)).UTC()
+			tsReliable = true
 		case string:
 			var err error
 			ts, err = time.Parse(time.RFC3339, v)
 			if err != nil {
 				log.Printf("warn: failed to parse created_at timestamp %q: %v, falling back to time.Now()", v, err)
+			} else {
+				tsReliable = true
 			}
 		}
 	}
 	if ts.IsZero() {
 		ts = time.Now().UTC()
+		tsReliable = false
 	}
 
 	// Build a stable ID from action + actor + timestamp.
@@ -153,7 +168,7 @@ func normalizeEntry(entry auditLogEntry, org string) (*event.Event, error) {
 		Timestamp: ts,
 		Org:       org,
 		Payload:   json.RawMessage(payload),
-	}, nil
+	}, tsReliable, nil
 }
 
 func sha256Digest(s string) []byte {
@@ -402,13 +417,18 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, time.Tim
 				}
 			}
 
-			ev, err := normalizeEntry(entry, c.org)
+			ev, tsReliable, err := normalizeEntry(entry, c.org)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
 			allEvents = append(allEvents, ev)
-			if ev.Timestamp.After(maxSeen) {
+			// Only a real source timestamp may advance the resume high-water
+			// mark. A fabricated time.Now() fallback (missing/unparseable
+			// created_at) must never poison maxSeen to "now" — that would
+			// silently skip every real event between the true high-water
+			// mark and now on the next run.
+			if tsReliable && ev.Timestamp.After(maxSeen) {
 				maxSeen = ev.Timestamp
 			}
 		}

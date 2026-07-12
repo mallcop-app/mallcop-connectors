@@ -150,7 +150,17 @@ type oktaLogEvent struct {
 // events. The canonical Type and detector-readable Payload come from the shared
 // normalize library (NOT the raw Okta eventType, which gates no detector, and
 // whose security fields are buried under client.* / target[] / outcome.*).
-func normalizeOktaEvent(raw map[string]interface{}, domain string) ([]*event.Event, error) {
+//
+// The second return value, tsReliable, is true only when the Timestamp on the
+// returned events came from the entry's own published field. When published
+// is missing or unparseable, ts falls back to time.Now().UTC() so the event
+// still has SOME timestamp for display/dedupe purposes — but that fabricated
+// value must never be allowed to advance the resume high-water mark (it
+// would silently poison the cursor to "now" and cause the next run to skip
+// every real event between the true high-water mark and now). Callers must
+// gate maxSeen updates on tsReliable, not merely on ev.Timestamp being
+// non-zero.
+func normalizeOktaEvent(raw map[string]interface{}, domain string) ([]*event.Event, bool, error) {
 	oktaEventType, _ := raw["eventType"].(string)
 
 	actor := ""
@@ -163,12 +173,15 @@ func normalizeOktaEvent(raw map[string]interface{}, domain string) ([]*event.Eve
 	}
 
 	ts := time.Now().UTC()
+	tsReliable := false
 	if published, ok := raw["published"].(string); ok && published != "" {
 		var err error
 		ts, err = time.Parse(time.RFC3339, published)
 		if err != nil {
 			log.Printf("warn: failed to parse published timestamp %q: %v", published, err)
 			ts = time.Now().UTC()
+		} else {
+			tsReliable = true
 		}
 	}
 
@@ -183,7 +196,7 @@ func normalizeOktaEvent(raw map[string]interface{}, domain string) ([]*event.Eve
 	for i, r := range results {
 		payload, err := r.PayloadJSON(raw)
 		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
+			return nil, false, fmt.Errorf("marshal payload: %w", err)
 		}
 		id := baseID
 		if i > 0 {
@@ -199,7 +212,7 @@ func normalizeOktaEvent(raw map[string]interface{}, domain string) ([]*event.Eve
 			Payload:   payload,
 		})
 	}
-	return out, nil
+	return out, tsReliable, nil
 }
 
 // parseNextLink extracts the rel="next" URL from an Okta Link header.
@@ -310,15 +323,22 @@ func (c *connector) fetchSystemLog(ctx context.Context) ([]*event.Event, time.Ti
 		resp.Body.Close()
 
 		for _, entry := range entries {
-			evs, err := normalizeOktaEvent(entry, c.domain)
+			evs, tsReliable, err := normalizeOktaEvent(entry, c.domain)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
 			allEvents = append(allEvents, evs...)
-			for _, ev := range evs {
-				if ev.Timestamp.After(maxSeen) {
-					maxSeen = ev.Timestamp
+			// Only a real source timestamp may advance the resume high-water
+			// mark. A fabricated time.Now() fallback (missing/unparseable
+			// published) must never poison maxSeen to "now" — that would
+			// silently skip every real event between the true high-water
+			// mark and now on the next run.
+			if tsReliable {
+				for _, ev := range evs {
+					if ev.Timestamp.After(maxSeen) {
+						maxSeen = ev.Timestamp
+					}
 				}
 			}
 		}
