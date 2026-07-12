@@ -1,14 +1,44 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
+
+// fakeCloudTrailPage is one page of a scripted LookupEvents response.
+type fakeCloudTrailPage struct {
+	events    []types.Event
+	nextToken *string
+}
+
+// fakeCloudTrail implements cloudtrailAPI entirely in memory (no network, no
+// live creds), mirroring the fakeS3Client idiom in aws_s3_test.go. It records
+// the StartTime seen on every call so tests can assert the resume floor was
+// actually sent to CloudTrail.
+type fakeCloudTrail struct {
+	pages         []fakeCloudTrailPage
+	call          int
+	gotStartTimes []*time.Time
+}
+
+func (f *fakeCloudTrail) LookupEvents(_ context.Context, in *cloudtrail.LookupEventsInput, _ ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error) {
+	f.gotStartTimes = append(f.gotStartTimes, in.StartTime)
+	if f.call >= len(f.pages) {
+		return &cloudtrail.LookupEventsOutput{}, nil
+	}
+	p := f.pages[f.call]
+	f.call++
+	return &cloudtrail.LookupEventsOutput{Events: p.events, NextToken: p.nextToken}, nil
+}
+
+func strPtr(s string) *string { return &s }
 
 func TestCursorRoundtrip(t *testing.T) {
 	key := sigKey("us-east-1")
@@ -75,7 +105,7 @@ func TestNormalizeEvent(t *testing.T) {
 		EventTime: &ts,
 	}
 
-	evs, err := normalizeEvent(e, "us-east-1")
+	evs, tsReliable, err := normalizeEvent(e, "us-east-1")
 	if err != nil {
 		t.Fatalf("normalizeEvent: %v", err)
 	}
@@ -98,6 +128,9 @@ func TestNormalizeEvent(t *testing.T) {
 	if ev.Timestamp != ts {
 		t.Errorf("Timestamp = %v, want %v", ev.Timestamp, ts)
 	}
+	if !tsReliable {
+		t.Error("tsReliable = false, want true when EventTime is present")
+	}
 	if ev.Org != "us-east-1" {
 		t.Errorf("Org = %q, want %q", ev.Org, "us-east-1")
 	}
@@ -118,7 +151,7 @@ func TestNormalizeEvent(t *testing.T) {
 func TestNormalizeEventMissingFields(t *testing.T) {
 	// Event with no username, no event name, no time.
 	e := types.Event{}
-	evs, err := normalizeEvent(e, "us-west-2")
+	evs, tsReliable, err := normalizeEvent(e, "us-west-2")
 	if err != nil {
 		t.Fatalf("normalizeEvent with empty fields: %v", err)
 	}
@@ -134,9 +167,15 @@ func TestNormalizeEventMissingFields(t *testing.T) {
 	if ev.Actor != "" {
 		t.Errorf("Actor = %q, want empty", ev.Actor)
 	}
-	// Timestamp should default to now (not zero).
+	// Timestamp should default to now (not zero) so the event still has SOME
+	// timestamp for display/dedupe purposes.
 	if ev.Timestamp.IsZero() {
 		t.Error("Timestamp is zero")
+	}
+	// But that fabricated timestamp must never be reported as reliable — the
+	// caller (fetchEvents) must not let it advance the resume high-water mark.
+	if tsReliable {
+		t.Error("tsReliable = true, want false when EventTime is missing (would poison the resume cursor to wall-clock now)")
 	}
 }
 
@@ -146,7 +185,7 @@ func TestNormalizeEventSchema(t *testing.T) {
 	ts := time.Now().UTC()
 	e := types.Event{EventId: &id, EventName: &name, EventTime: &ts}
 
-	evs, err := normalizeEvent(e, "us-east-1")
+	evs, _, err := normalizeEvent(e, "us-east-1")
 	if err != nil {
 		t.Fatalf("normalizeEvent: %v", err)
 	}
@@ -174,5 +213,154 @@ func TestNormalizeEventSchema(t *testing.T) {
 	}
 	if decoded.Source != "aws" {
 		t.Errorf("Source mismatch: %q", decoded.Source)
+	}
+}
+
+// --- mallcoppro-bb2: high-water cursor semantics (LookupEvents mode only) ---
+
+// (a) complete pagination emits a cursor whose decoded payload is the max
+// emitted event timestamp (RFC3339Nano), NOT a pagination token (NextToken).
+func TestFetchEventsCompletePaginationHighWaterCursor(t *testing.T) {
+	t1 := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	t2 := time.Date(2024, 6, 1, 13, 30, 0, 0, time.UTC)
+	name := "ConsoleLogin"
+	client := &fakeCloudTrail{
+		pages: []fakeCloudTrailPage{
+			{events: []types.Event{{EventId: strPtr("e1"), EventName: &name, EventTime: &t1}}, nextToken: strPtr("page-2-token")},
+			{events: []types.Event{{EventId: strPtr("e2"), EventName: &name, EventTime: &t2}}},
+		},
+	}
+
+	events, maxSeen, err := fetchEvents(context.Background(), client, "us-east-1", time.Time{})
+	if err != nil {
+		t.Fatalf("fetchEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events (full pagination), got %d", len(events))
+	}
+	if client.call != 2 {
+		t.Fatalf("want 2 LookupEvents calls, got %d", client.call)
+	}
+	if !maxSeen.Equal(t2) {
+		t.Fatalf("maxSeen = %v, want %v", maxSeen, t2)
+	}
+
+	key := sigKey("us-east-1")
+	encoded := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
+	decoded, err := decodeCursor(encoded, key)
+	if err != nil {
+		t.Fatalf("decodeCursor: %v", err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, decoded); err != nil {
+		t.Fatalf("cursor payload is not a timestamp (looks like a NextToken): %v", err)
+	}
+}
+
+// (b) resume with a timestamp cursor queries from that timestamp
+// inclusively — assert LookupEventsInput.StartTime reflects T.
+func TestFetchEventsResumePassesFloorAsStartTime(t *testing.T) {
+	floor := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	client := &fakeCloudTrail{}
+
+	if _, _, err := fetchEvents(context.Background(), client, "us-east-1", floor); err != nil {
+		t.Fatalf("fetchEvents: %v", err)
+	}
+	if len(client.gotStartTimes) != 1 || client.gotStartTimes[0] == nil {
+		t.Fatalf("LookupEvents StartTime not set: %v", client.gotStartTimes)
+	}
+	if !client.gotStartTimes[0].Equal(floor) {
+		t.Errorf("StartTime = %v, want %v (inclusive resume, CloudTrail's own >= semantics)", *client.gotStartTimes[0], floor)
+	}
+}
+
+// (c) a legacy pagination-token cursor (HMAC-valid, non-timestamp payload)
+// warns and falls back to the 24h window — the run SUCCEEDS.
+func TestResolveFloorLegacyPaginationTokenFallsBack(t *testing.T) {
+	key := sigKey("us-east-1")
+	legacyCursor := encodeCursor("AQIDAHiXkl4xxxxxxNextToken", key)
+
+	before := time.Now().UTC()
+	floor, legacy, err := resolveFloor(legacyCursor, time.Time{}, key)
+	after := time.Now().UTC()
+	if err != nil {
+		t.Fatalf("resolveFloor: legacy cursor must not hard-fail, got: %v", err)
+	}
+	if !legacy {
+		t.Error("legacy = false, want true for a non-timestamp HMAC-valid payload")
+	}
+	wantMin := before.Add(-legacyCursorFallback)
+	wantMax := after.Add(-legacyCursorFallback)
+	if floor.Before(wantMin) || floor.After(wantMax) {
+		t.Errorf("floor = %v, want within [%v, %v] (now - 24h)", floor, wantMin, wantMax)
+	}
+
+	// Prove the run actually succeeds end-to-end with the fallback floor.
+	client := &fakeCloudTrail{}
+	if _, _, err := fetchEvents(context.Background(), client, "us-east-1", floor); err != nil {
+		t.Fatalf("fetchEvents after legacy-cursor fallback: %v", err)
+	}
+}
+
+// (d0) a page mixing a good-timestamp event with a missing-timestamp event
+// must advance maxSeen to the good event's time, NOT to the fabricated
+// time.Now() fallback used for the missing-timestamp event's own Timestamp
+// field. Regression test for the high-water cursor poisoning bug: before the
+// fix, the missing-EventTime event's fallback ts (~now) always sorted after
+// the real event and became maxSeen, silently skipping every real event
+// between the true high-water mark and "now" on the next run.
+func TestFetchEventsMissingTimestampDoesNotPoisonMaxSeen(t *testing.T) {
+	good := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	name := "ConsoleLogin"
+	client := &fakeCloudTrail{
+		pages: []fakeCloudTrailPage{
+			{events: []types.Event{
+				{EventId: strPtr("e-good"), EventName: &name, EventTime: &good},
+				// No EventId/EventTime: normalizeEvent falls back to
+				// time.Now().UTC(), which is always AFTER `good`.
+				{EventName: &name},
+			}},
+		},
+	}
+
+	events, maxSeen, err := fetchEvents(context.Background(), client, "us-east-1", time.Time{})
+	if err != nil {
+		t.Fatalf("fetchEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events emitted (both, even the unreliable one), got %d", len(events))
+	}
+	if !maxSeen.Equal(good) {
+		t.Fatalf("maxSeen = %v, want %v (the fabricated now() timestamp on the missing-EventTime event must not advance the cursor)", maxSeen, good)
+	}
+}
+
+// (d) zero events emitted -> caller (run()) must not print a "cursor:" line.
+// fetchEvents itself signals this via a zero maxSeen.
+func TestFetchEventsZeroEventsNoCursor(t *testing.T) {
+	client := &fakeCloudTrail{pages: []fakeCloudTrailPage{{events: nil}}}
+	events, maxSeen, err := fetchEvents(context.Background(), client, "us-east-1", time.Time{})
+	if err != nil {
+		t.Fatalf("fetchEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("want 0 events, got %d", len(events))
+	}
+	if !maxSeen.IsZero() {
+		t.Errorf("maxSeen = %v, want zero (no cursor should be emitted)", maxSeen)
+	}
+}
+
+// (e) a tampered (HMAC-invalid) cursor still hard-fails.
+func TestResolveFloorTamperedCursorHardFails(t *testing.T) {
+	key := sigKey("us-east-1")
+	encoded := encodeCursor("2024-06-01T12:00:00Z", key)
+	parts := strings.SplitN(encoded, ".", 2)
+	payload := []byte(parts[0])
+	payload[len(payload)-1] ^= 0x01
+	tampered := string(payload) + "." + parts[1]
+
+	_, _, err := resolveFloor(tampered, time.Time{}, key)
+	if err == nil {
+		t.Fatal("expected hard failure for tampered cursor, got nil")
 	}
 }

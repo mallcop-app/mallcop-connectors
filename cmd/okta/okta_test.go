@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -120,7 +123,7 @@ func TestNormalizeOktaEvent(t *testing.T) {
 		},
 	}
 
-	evs, err := normalizeOktaEvent(raw, "myorg.okta.com")
+	evs, tsReliable, err := normalizeOktaEvent(raw, "myorg.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
@@ -131,6 +134,9 @@ func TestNormalizeOktaEvent(t *testing.T) {
 
 	if ev.Source != "okta" {
 		t.Errorf("Source = %q, want okta", ev.Source)
+	}
+	if !tsReliable {
+		t.Error("tsReliable = false, want true when published is present and parseable")
 	}
 	// The raw Okta eventType gates no detector; user.session.start maps to the
 	// canonical "login" type, with ip/geo promoted to the flat payload.
@@ -175,7 +181,7 @@ func TestNormalizeOktaEventActorFallback(t *testing.T) {
 		},
 	}
 
-	evs, err := normalizeOktaEvent(raw, "corp.okta.com")
+	evs, _, err := normalizeOktaEvent(raw, "corp.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
@@ -191,7 +197,7 @@ func TestNormalizeOktaEventActorFallback(t *testing.T) {
 }
 
 func TestNormalizeOktaEventMissingFields(t *testing.T) {
-	evs, err := normalizeOktaEvent(map[string]interface{}{}, "empty.okta.com")
+	evs, tsReliable, err := normalizeOktaEvent(map[string]interface{}{}, "empty.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent with empty map: %v", err)
 	}
@@ -208,6 +214,12 @@ func TestNormalizeOktaEventMissingFields(t *testing.T) {
 	if ev.Timestamp.IsZero() {
 		t.Error("Timestamp is zero")
 	}
+	// The fabricated fallback timestamp must never be reported as reliable —
+	// the caller (fetchSystemLog) must not let it advance the resume
+	// high-water mark.
+	if tsReliable {
+		t.Error("tsReliable = true, want false when published is missing (would poison the resume cursor to wall-clock now)")
+	}
 }
 
 func TestNormalizeOktaEventSchemaRoundtrip(t *testing.T) {
@@ -217,7 +229,7 @@ func TestNormalizeOktaEventSchemaRoundtrip(t *testing.T) {
 		"eventType": "policy.lifecycle.update",
 	}
 
-	evs, err := normalizeOktaEvent(raw, "org.okta.com")
+	evs, _, err := normalizeOktaEvent(raw, "org.okta.com")
 	if err != nil {
 		t.Fatalf("normalizeOktaEvent: %v", err)
 	}
@@ -241,5 +253,188 @@ func TestNormalizeOktaEventSchemaRoundtrip(t *testing.T) {
 	}
 	if decoded.Source != "okta" {
 		t.Errorf("Source mismatch: %q", decoded.Source)
+	}
+}
+
+// --- mallcoppro-bb2: high-water cursor semantics ---
+
+// testDomain returns the connector's domain field for a TLS test server
+// (fetchSystemLog hardcodes "https://" against c.domain, so the test server
+// must be TLS and the client must trust its cert — see server.Client()).
+func testDomain(serverURL string) string {
+	return strings.TrimPrefix(serverURL, "https://")
+}
+
+// (a) complete pagination emits a cursor whose decoded payload is the max
+// emitted published timestamp (RFC3339Nano), NOT a pagination token (the
+// Link header's "next" URL).
+func TestFetchSystemLogCompletePaginationHighWaterCursor(t *testing.T) {
+	call := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call++
+		w.Header().Set("Content-Type", "application/json")
+		switch call {
+		case 1:
+			w.Header().Set("Link", `<https://`+r.Host+`/api/v1/logs?after=abc>; rel="next"`)
+			json.NewEncoder(w).Encode([]map[string]interface{}{
+				{"uuid": "e1", "eventType": "user.session.start", "published": "2024-06-01T12:00:00.000Z"},
+			})
+		case 2:
+			json.NewEncoder(w).Encode([]map[string]interface{}{
+				{"uuid": "e2", "eventType": "user.session.start", "published": "2024-06-01T13:30:00.500Z"},
+			})
+		default:
+			t.Fatalf("unexpected extra request %d", call)
+		}
+	}))
+	defer srv.Close()
+
+	conn := &connector{client: srv.Client(), domain: testDomain(srv.URL), apiToken: "tok"}
+	events, maxSeen, err := conn.fetchSystemLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchSystemLog: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events (full pagination), got %d", len(events))
+	}
+	if call != 2 {
+		t.Fatalf("want 2 requests, got %d", call)
+	}
+	want := time.Date(2024, 6, 1, 13, 30, 0, 500000000, time.UTC)
+	if !maxSeen.Equal(want) {
+		t.Fatalf("maxSeen = %v, want %v", maxSeen, want)
+	}
+
+	key := sigKey(conn.domain)
+	encoded := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
+	decoded, err := decodeCursor(encoded, key)
+	if err != nil {
+		t.Fatalf("decodeCursor: %v", err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, decoded); err != nil {
+		t.Fatalf("cursor payload is not a timestamp (looks like a polling link): %v", err)
+	}
+}
+
+// (a2) a page mixing a good-timestamp entry with a missing-published entry
+// must advance maxSeen to the good entry's time, NOT to the fabricated
+// time.Now() fallback used for the missing-timestamp entry's own Timestamp
+// field. Regression test for the high-water cursor poisoning bug.
+func TestFetchSystemLogMissingTimestampDoesNotPoisonMaxSeen(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]interface{}{
+			{"uuid": "e1", "eventType": "user.session.start", "published": "2024-06-01T12:00:00.000Z"},
+			// No published: normalizeOktaEvent falls back to
+			// time.Now().UTC(), which is always AFTER the good entry.
+			{"uuid": "e2", "eventType": "user.session.start"},
+		})
+	}))
+	defer srv.Close()
+
+	conn := &connector{client: srv.Client(), domain: testDomain(srv.URL), apiToken: "tok"}
+	events, maxSeen, err := conn.fetchSystemLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchSystemLog: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events emitted (both, even the unreliable one), got %d", len(events))
+	}
+	want := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	if !maxSeen.Equal(want) {
+		t.Fatalf("maxSeen = %v, want %v (the fabricated now() timestamp on the missing-published entry must not advance the cursor)", maxSeen, want)
+	}
+}
+
+// (b) resume with a timestamp cursor queries from that timestamp
+// inclusively — assert the request's since= param reflects T.
+func TestFetchSystemLogResumeUsesInclusiveSinceParam(t *testing.T) {
+	var gotSince string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSince = r.URL.Query().Get("since")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]interface{}{})
+	}))
+	defer srv.Close()
+
+	floor := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	conn := &connector{client: srv.Client(), domain: testDomain(srv.URL), apiToken: "tok", since: floor}
+	if _, _, err := conn.fetchSystemLog(context.Background()); err != nil {
+		t.Fatalf("fetchSystemLog: %v", err)
+	}
+
+	want := "2024-06-01T12:00:00Z"
+	if gotSince != want {
+		t.Errorf("since= %q, want %q (System Log's own inclusive lower bound)", gotSince, want)
+	}
+}
+
+// (c) a legacy pagination-token cursor (HMAC-valid, non-timestamp payload)
+// warns and falls back to the 24h window — the run SUCCEEDS.
+func TestResolveFloorLegacyPaginationTokenFallsBack(t *testing.T) {
+	key := sigKey("myorg.okta.com")
+	legacyCursor := encodeCursor("https://myorg.okta.com/api/v1/logs?after=1234567890abcdef&limit=1000", key)
+
+	before := time.Now().UTC()
+	floor, legacy, err := resolveFloor(legacyCursor, time.Time{}, key)
+	after := time.Now().UTC()
+	if err != nil {
+		t.Fatalf("resolveFloor: legacy cursor must not hard-fail, got: %v", err)
+	}
+	if !legacy {
+		t.Error("legacy = false, want true for a non-timestamp HMAC-valid payload")
+	}
+	wantMin := before.Add(-legacyCursorFallback)
+	wantMax := after.Add(-legacyCursorFallback)
+	if floor.Before(wantMin) || floor.After(wantMax) {
+		t.Errorf("floor = %v, want within [%v, %v] (now - 24h)", floor, wantMin, wantMax)
+	}
+
+	// Prove the run actually succeeds end-to-end with the fallback floor.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]interface{}{})
+	}))
+	defer srv.Close()
+	conn := &connector{client: srv.Client(), domain: testDomain(srv.URL), apiToken: "tok", since: floor}
+	if _, _, err := conn.fetchSystemLog(context.Background()); err != nil {
+		t.Fatalf("fetchSystemLog after legacy-cursor fallback: %v", err)
+	}
+}
+
+// (d) zero events emitted -> caller (run()) must not print a "cursor:" line.
+// fetchSystemLog itself signals this via a zero maxSeen.
+func TestFetchSystemLogZeroEventsNoCursor(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]interface{}{})
+	}))
+	defer srv.Close()
+
+	conn := &connector{client: srv.Client(), domain: testDomain(srv.URL), apiToken: "tok"}
+	events, maxSeen, err := conn.fetchSystemLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchSystemLog: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("want 0 events, got %d", len(events))
+	}
+	if !maxSeen.IsZero() {
+		t.Errorf("maxSeen = %v, want zero (no cursor should be emitted)", maxSeen)
+	}
+}
+
+// (e) a tampered (HMAC-invalid) cursor still hard-fails.
+func TestResolveFloorTamperedCursorHardFails(t *testing.T) {
+	key := sigKey("myorg.okta.com")
+	encoded := encodeCursor("2024-06-01T12:00:00Z", key)
+	parts := strings.SplitN(encoded, ".", 2)
+	payload := []byte(parts[0])
+	payload[len(payload)-1] ^= 0x01
+	tampered := string(payload) + "." + parts[1]
+
+	_, _, err := resolveFloor(tampered, time.Time{}, key)
+	if err == nil {
+		t.Fatal("expected hard failure for tampered cursor, got nil")
 	}
 }

@@ -38,7 +38,7 @@ func TestGCPAuditLogIntegration(t *testing.T) {
 	}
 
 	since := time.Now().UTC().Add(-7 * 24 * time.Hour)
-	events, _, err := fetchAuditLogs(ctx, svc, projectID, since, "")
+	events, _, err := fetchAuditLogs(ctx, svc, projectID, since)
 	if err != nil {
 		t.Fatalf("fetchAuditLogs: %v", err)
 	}

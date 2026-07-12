@@ -35,6 +35,11 @@ import (
 const (
 	cursorMaxLen = 2000
 	pageSize     = int64(1000)
+
+	// legacyCursorFallback is the re-scan window used when an HMAC-valid
+	// cursor is found to carry a pre-highwater Cloud Logging page token
+	// instead of a timestamp. See run()'s cursor decode for the migration.
+	legacyCursorFallback = 24 * time.Hour
 )
 
 var cursorRE = regexp.MustCompile(`^[A-Za-z0-9+/=_\-]+$`)
@@ -91,11 +96,53 @@ func sha256Hex(s string) string {
 	return fmt.Sprintf("%x", h[:])
 }
 
+// resolveFloor decodes an optional checkpoint cursor and combines it with
+// --since to produce the effective query floor (the later of the two
+// timestamps wins). An HMAC-valid cursor whose payload does not parse as a
+// timestamp is a legacy pre-highwater pagination token: resolveFloor never
+// resumes it and never hard-fails on it — it self-heals by falling back to
+// legacyCursorFallback and reports legacy=true so the caller can log the
+// one-line warning. An HMAC-invalid (tampered) cursor still hard-fails.
+func resolveFloor(cursorArg string, sinceTime time.Time, key []byte) (floor time.Time, legacy bool, err error) {
+	var cursorMark time.Time
+	if cursorArg != "" {
+		raw, err := decodeCursor(cursorArg, key)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("invalid checkpoint cursor: %w", err)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			legacy = true
+			cursorMark = time.Now().UTC().Add(-legacyCursorFallback)
+		} else {
+			cursorMark = ts.UTC()
+		}
+	}
+
+	// When both --cursor and --since are supplied, the later (more recent)
+	// timestamp wins.
+	floor = sinceTime
+	if cursorMark.After(floor) {
+		floor = cursorMark
+	}
+	return floor, legacy, nil
+}
+
 // normalizeLogEntry maps a raw GCP Cloud Audit Log entry to one or more mallcop
 // events. The canonical Type and detector-readable Payload come from the shared
 // normalize library (NOT the raw protoPayload.methodName, which gates no
 // detector). A SetIamPolicy granting a privileged role fans out to two events.
-func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Event, error) {
+//
+// The second return value, tsReliable, is true only when the Timestamp on the
+// returned events came from the entry's own Timestamp field. When Timestamp
+// is missing or unparseable, ts falls back to time.Now().UTC() so the event
+// still has SOME timestamp for display/dedupe purposes — but that fabricated
+// value must never be allowed to advance the resume high-water mark (it
+// would silently poison the cursor to "now" and cause the next run to skip
+// every real event between the true high-water mark and now). Callers must
+// gate maxSeen updates on tsReliable, not merely on ev.Timestamp being
+// non-zero.
+func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Event, bool, error) {
 	var proto map[string]interface{}
 	if entry.ProtoPayload != nil {
 		_ = json.Unmarshal(entry.ProtoPayload, &proto)
@@ -115,6 +162,7 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 
 	// Parse timestamp.
 	ts := time.Now().UTC()
+	tsReliable := false
 	if entry.Timestamp != "" {
 		var err error
 		ts, err = time.Parse(time.RFC3339Nano, entry.Timestamp)
@@ -123,7 +171,11 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 			if err != nil {
 				log.Printf("warn: failed to parse timestamp %q: %v", entry.Timestamp, err)
 				ts = time.Now().UTC()
+			} else {
+				tsReliable = true
 			}
+		} else {
+			tsReliable = true
 		}
 	}
 
@@ -138,7 +190,7 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 	for i, r := range results {
 		payload, err := r.PayloadJSON(proto)
 		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
+			return nil, false, fmt.Errorf("marshal payload: %w", err)
 		}
 		id := baseID
 		if i > 0 {
@@ -154,7 +206,7 @@ func normalizeLogEntry(entry *logging.LogEntry, projectID string) ([]*event.Even
 			Payload:   payload,
 		})
 	}
-	return out, nil
+	return out, tsReliable, nil
 }
 
 func newLoggingClient(ctx context.Context) (*logging.Service, error) {
@@ -186,10 +238,20 @@ func newLoggingClient(ctx context.Context) (*logging.Service, error) {
 	return svc, nil
 }
 
-func fetchAuditLogs(ctx context.Context, svc *logging.Service, projectID string, since time.Time, pageToken string) ([]*event.Event, string, error) {
+// fetchAuditLogs pages Entries.List to completion and returns every event
+// plus the maximum entry timestamp among them. floor is the effective query
+// start (max of --since and any decoded cursor high-water mark, computed by
+// the caller) and is built into the filter as an inclusive "timestamp >="
+// bound: a resumed run must never lose an event sharing the exact
+// high-water timestamp with the last emitted event of the prior run.
+// Re-emitted boundary duplicates are dropped downstream by mallcop core's
+// per-ID dedupe (v0.11.3+). The connector never persists or resumes
+// NextPageToken across runs — it is a one-shot continuation of THIS query
+// only (mallcoppro-bb2).
+func fetchAuditLogs(ctx context.Context, svc *logging.Service, projectID string, floor time.Time) ([]*event.Event, time.Time, error) {
 	filter := `logName=("projects/` + projectID + `/logs/cloudaudit.googleapis.com%2Factivity" OR "projects/` + projectID + `/logs/cloudaudit.googleapis.com%2Fdata_access")`
-	if !since.IsZero() {
-		filter += fmt.Sprintf(` AND timestamp >= "%s"`, since.UTC().Format(time.RFC3339))
+	if !floor.IsZero() {
+		filter += fmt.Sprintf(` AND timestamp >= "%s"`, floor.UTC().Format(time.RFC3339))
 	}
 
 	req := &logging.ListLogEntriesRequest{
@@ -198,36 +260,44 @@ func fetchAuditLogs(ctx context.Context, svc *logging.Service, projectID string,
 		OrderBy:       "timestamp desc",
 		PageSize:      pageSize,
 	}
-	if pageToken != "" {
-		req.PageToken = pageToken
-	}
 
 	var allEvents []*event.Event
-	lastPageToken := ""
+	var maxSeen time.Time
 
 	for {
 		resp, err := svc.Entries.List(req).Context(ctx).Do()
 		if err != nil {
-			return nil, "", fmt.Errorf("entries.list: %w", err)
+			return nil, time.Time{}, fmt.Errorf("entries.list: %w", err)
 		}
 
 		for _, entry := range resp.Entries {
-			evs, err := normalizeLogEntry(entry, projectID)
+			evs, tsReliable, err := normalizeLogEntry(entry, projectID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping entry: %v\n", err)
 				continue
 			}
 			allEvents = append(allEvents, evs...)
+			// Only a real source timestamp may advance the resume high-water
+			// mark. A fabricated time.Now() fallback (missing/unparseable
+			// Timestamp) must never poison maxSeen to "now" — that would
+			// silently skip every real event between the true high-water
+			// mark and now on the next run.
+			if tsReliable {
+				for _, ev := range evs {
+					if ev.Timestamp.After(maxSeen) {
+						maxSeen = ev.Timestamp
+					}
+				}
+			}
 		}
 
 		if resp.NextPageToken == "" {
 			break
 		}
-		lastPageToken = resp.NextPageToken
 		req.PageToken = resp.NextPageToken
 	}
 
-	return allEvents, lastPageToken, nil
+	return allEvents, maxSeen, nil
 }
 
 func run() error {
@@ -258,13 +328,12 @@ func run() error {
 	}
 
 	key := sigKey(*projectID)
-	rawCursor := ""
-	if *cursorArg != "" {
-		var err error
-		rawCursor, err = decodeCursor(*cursorArg, key)
-		if err != nil {
-			return fmt.Errorf("invalid checkpoint cursor: %w", err)
-		}
+	floor, legacy, err := resolveFloor(*cursorArg, sinceTime, key)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		fmt.Fprintf(os.Stderr, "warn: legacy pagination-token cursor detected; discarding and re-scanning the last 24h\n")
 	}
 
 	ctx := context.Background()
@@ -273,7 +342,7 @@ func run() error {
 		return fmt.Errorf("create logging client: %w", err)
 	}
 
-	events, nextPageToken, err := fetchAuditLogs(ctx, svc, *projectID, sinceTime, rawCursor)
+	events, maxSeen, err := fetchAuditLogs(ctx, svc, *projectID, floor)
 	if err != nil {
 		return fmt.Errorf("fetch audit logs: %w", err)
 	}
@@ -286,8 +355,10 @@ func run() error {
 		}
 	}
 
-	if nextPageToken != "" {
-		encoded := encodeCursor(nextPageToken, key)
+	// Only emit a cursor when at least one event was emitted this run; zero
+	// events means the caller should keep using its previous cursor.
+	if !maxSeen.IsZero() {
+		encoded := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
 		fmt.Fprintf(os.Stderr, "cursor: %s\n", encoded)
 	}
 

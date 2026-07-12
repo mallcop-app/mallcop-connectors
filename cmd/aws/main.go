@@ -32,6 +32,11 @@ import (
 const (
 	cursorMaxLen = 1000
 	maxPages     = 0 // 0 = unlimited
+
+	// legacyCursorFallback is the re-scan window used when an HMAC-valid
+	// cursor is found to carry a pre-highwater LookupEvents NextToken
+	// instead of a timestamp. See run()'s cursor decode for the migration.
+	legacyCursorFallback = 24 * time.Hour
 )
 
 var cursorRE = regexp.MustCompile(`^[A-Za-z0-9+/=_\-]+$`)
@@ -88,18 +93,59 @@ func sha256Hex(s string) string {
 	return fmt.Sprintf("%x", h[:])
 }
 
+// resolveFloor decodes an optional checkpoint cursor and combines it with
+// --since to produce the effective query floor (the later of the two
+// timestamps wins). An HMAC-valid cursor whose payload does not parse as a
+// timestamp is a legacy pre-highwater pagination token: resolveFloor never
+// resumes it and never hard-fails on it — it self-heals by falling back to
+// legacyCursorFallback and reports legacy=true so the caller can log the
+// one-line warning. An HMAC-invalid (tampered) cursor still hard-fails.
+func resolveFloor(cursorArg string, sinceTime time.Time, key []byte) (floor time.Time, legacy bool, err error) {
+	var cursorMark time.Time
+	if cursorArg != "" {
+		raw, err := decodeCursor(cursorArg, key)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("invalid checkpoint cursor: %w", err)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			legacy = true
+			cursorMark = time.Now().UTC().Add(-legacyCursorFallback)
+		} else {
+			cursorMark = ts.UTC()
+		}
+	}
+
+	// When both --cursor and --since are supplied, the later (more recent)
+	// timestamp wins.
+	floor = sinceTime
+	if cursorMark.After(floor) {
+		floor = cursorMark
+	}
+	return floor, legacy, nil
+}
+
 // normalizeEvent maps a raw CloudTrail event to one or more mallcop events. The
 // canonical Type and detector-readable Payload come from the shared normalize
 // library (NOT the raw CloudTrail eventName, which gates no detector). A single
 // raw event may map to multiple canonical events.
-func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
+//
+// The second return value, tsReliable, is true only when the Timestamp on the
+// returned events came from CloudTrail's own EventTime field. When EventTime
+// is missing, ts falls back to time.Now().UTC() so the event still has SOME
+// timestamp for display/dedupe purposes — but that fabricated value must
+// never be allowed to advance the resume high-water mark (it would silently
+// poison the cursor to "now" and cause the next run to skip every real event
+// between the true high-water mark and now). Callers must gate maxSeen
+// updates on tsReliable, not merely on ev.Timestamp being non-zero.
+func normalizeEvent(e types.Event, region string) ([]*event.Event, bool, error) {
 	rawJSON, err := json.Marshal(e)
 	if err != nil {
-		return nil, fmt.Errorf("marshal event: %w", err)
+		return nil, false, fmt.Errorf("marshal event: %w", err)
 	}
 	var rawMap map[string]any
 	if err := json.Unmarshal(rawJSON, &rawMap); err != nil {
-		return nil, fmt.Errorf("decode event: %w", err)
+		return nil, false, fmt.Errorf("decode event: %w", err)
 	}
 
 	actor := ""
@@ -113,8 +159,10 @@ func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
 	}
 
 	ts := time.Now().UTC()
+	tsReliable := false
 	if e.EventTime != nil {
 		ts = e.EventTime.UTC()
+		tsReliable = true
 	}
 
 	idSrc := fmt.Sprintf("aws:cloudtrail:%s:%d", region, ts.UnixNano())
@@ -128,7 +176,7 @@ func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
 	for i, r := range results {
 		payload, err := r.PayloadJSON(rawMap)
 		if err != nil {
-			return nil, fmt.Errorf("marshal payload: %w", err)
+			return nil, false, fmt.Errorf("marshal payload: %w", err)
 		}
 		id := baseID
 		if i > 0 {
@@ -144,44 +192,69 @@ func normalizeEvent(e types.Event, region string) ([]*event.Event, error) {
 			Payload:   payload,
 		})
 	}
-	return out, nil
+	return out, tsReliable, nil
 }
 
-func fetchEvents(ctx context.Context, client *cloudtrail.Client, region string, since time.Time, nextToken string) ([]*event.Event, string, error) {
+// cloudtrailAPI is the subset of *cloudtrail.Client used by LookupEvents
+// mode. Tests inject a fake implementation so no network or live creds are
+// needed (mirrors s3trail.go's s3API interface for the S3 mode).
+type cloudtrailAPI interface {
+	LookupEvents(ctx context.Context, params *cloudtrail.LookupEventsInput, optFns ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error)
+}
+
+// fetchEvents pages LookupEvents to completion and returns every event plus
+// the maximum EventTime among them. floor is the effective query start
+// (max of --since and any decoded cursor high-water mark, computed by the
+// caller) and is passed as StartTime, which CloudTrail treats as an
+// inclusive lower bound ("events that occur at or after"): a resumed run
+// must never lose an event sharing the exact high-water timestamp with the
+// last emitted event of the prior run. Re-emitted boundary duplicates are
+// dropped downstream by mallcop core's per-ID dedupe (v0.11.3+). The
+// connector never persists or resumes NextToken across runs — it is a
+// one-shot continuation of THIS query only (mallcoppro-bb2).
+func fetchEvents(ctx context.Context, client cloudtrailAPI, region string, floor time.Time) ([]*event.Event, time.Time, error) {
 	input := &cloudtrail.LookupEventsInput{}
-	if !since.IsZero() {
-		input.StartTime = &since
-	}
-	if nextToken != "" {
-		input.NextToken = &nextToken
+	if !floor.IsZero() {
+		input.StartTime = &floor
 	}
 
 	var allEvents []*event.Event
-	lastToken := ""
+	var maxSeen time.Time
 
 	for {
 		out, err := client.LookupEvents(ctx, input)
 		if err != nil {
-			return nil, "", fmt.Errorf("LookupEvents: %w", err)
+			return nil, time.Time{}, fmt.Errorf("LookupEvents: %w", err)
 		}
 
 		for _, e := range out.Events {
-			evs, err := normalizeEvent(e, region)
+			evs, tsReliable, err := normalizeEvent(e, region)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: skipping event: %v\n", err)
 				continue
 			}
 			allEvents = append(allEvents, evs...)
+			// Only a real source timestamp may advance the resume high-water
+			// mark. A fabricated time.Now() fallback (missing/unparseable
+			// EventTime) must never poison maxSeen to "now" — that would
+			// silently skip every real event between the true high-water
+			// mark and now on the next run.
+			if tsReliable {
+				for _, ev := range evs {
+					if ev.Timestamp.After(maxSeen) {
+						maxSeen = ev.Timestamp
+					}
+				}
+			}
 		}
 
 		if out.NextToken == nil || *out.NextToken == "" {
 			break
 		}
-		lastToken = *out.NextToken
 		input.NextToken = out.NextToken
 	}
 
-	return allEvents, lastToken, nil
+	return allEvents, maxSeen, nil
 }
 
 func run() error {
@@ -218,13 +291,12 @@ func run() error {
 	}
 
 	key := sigKey(awsRegion)
-	rawCursor := ""
-	if *cursorArg != "" {
-		var err error
-		rawCursor, err = decodeCursor(*cursorArg, key)
-		if err != nil {
-			return fmt.Errorf("invalid checkpoint cursor: %w", err)
-		}
+	floor, legacy, err := resolveFloor(*cursorArg, sinceTime, key)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		fmt.Fprintf(os.Stderr, "warn: legacy pagination-token cursor detected; discarding and re-scanning the last 24h\n")
 	}
 
 	cfg, err := config.LoadDefaultConfig(ctx(), config.WithRegion(awsRegion))
@@ -233,7 +305,7 @@ func run() error {
 	}
 	client := cloudtrail.NewFromConfig(cfg)
 
-	events, nextToken, err := fetchEvents(ctx(), client, awsRegion, sinceTime, rawCursor)
+	events, maxSeen, err := fetchEvents(ctx(), client, awsRegion, floor)
 	if err != nil {
 		return fmt.Errorf("fetch events: %w", err)
 	}
@@ -246,8 +318,10 @@ func run() error {
 		}
 	}
 
-	if nextToken != "" {
-		encoded := encodeCursor(nextToken, key)
+	// Only emit a cursor when at least one event was emitted this run; zero
+	// events means the caller should keep using its previous cursor.
+	if !maxSeen.IsZero() {
+		encoded := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
 		fmt.Fprintf(os.Stderr, "cursor: %s\n", encoded)
 	}
 

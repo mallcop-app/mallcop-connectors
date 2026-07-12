@@ -41,7 +41,7 @@ func TestAWSCloudTrailIntegration(t *testing.T) {
 
 	// Fetch last 7 days.
 	since := time.Now().UTC().Add(-7 * 24 * time.Hour)
-	events, _, err := fetchEvents(context.Background(), client, region, since, "")
+	events, _, err := fetchEvents(context.Background(), client, region, since)
 	if err != nil {
 		t.Fatalf("fetchEvents: %v", err)
 	}
