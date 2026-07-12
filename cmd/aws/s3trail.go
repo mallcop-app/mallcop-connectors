@@ -308,7 +308,16 @@ func runS3Mode(ctx context.Context, client s3API, bucket, prefix string, since, 
 
 	startDate := since
 	if startDate.IsZero() {
-		startDate = time.Now().UTC()
+		// Cursor-resumed runs pass no --since (the cursor wins in exec.go).
+		// Enumerate from the resume mark's UTC date, NOT today: an object
+		// delivered late yesterday (LastModified after the mark) lives under
+		// yesterday's day prefix, and a today-only listing would drop it —
+		// a silent midnight-boundary event loss on every hourly cadence.
+		if !resumeMark.IsZero() {
+			startDate = resumeMark
+		} else {
+			startDate = time.Now().UTC()
+		}
 	}
 	startDate = time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
 	today := time.Now().UTC()

@@ -579,3 +579,35 @@ func TestResolveTrailPrefix(t *testing.T) {
 		t.Errorf("resolveTrailPrefix should append trailing slash: got %q", got)
 	}
 }
+
+func TestS3Mode_CursorResumeSpansMidnightBoundary(t *testing.T) {
+	// A cursor-resumed run passes no --since (the persisted cursor wins in
+	// mallcop's exec.go), so runS3Mode receives a zero since. An object
+	// delivered late yesterday — LastModified AFTER the previous run's mark,
+	// key under YESTERDAY's day prefix — must still be enumerated: startDate
+	// must derive from the resume mark's date, not today, or the hourly
+	// cadence silently drops every event delivered in the last minutes before
+	// midnight UTC.
+	now := time.Now().UTC()
+	yesterday := now.Add(-24 * time.Hour)
+	yDay := yesterday.Format("2006/01/02")
+	mark := yesterday.Add(-1 * time.Hour)
+	lateMod := yesterday.Add(30 * time.Minute)
+
+	client := &fakeS3Client{objects: []fakeObject{{
+		key:          "AWSLogs/o-abc1234567/111111111111/CloudTrail/us-east-1/" + yDay + "/111111111111_CloudTrail_us-east-1_latenight.json.gz",
+		body:         gzipRecords(t, []map[string]any{attachUserPolicy("evt-midnight", yesterday.Format(time.RFC3339))}),
+		lastModified: lateMod,
+	}}}
+
+	events, newMark, err := runS3Mode(context.Background(), client, "bucket", "AWSLogs/", time.Time{}, mark)
+	if err != nil {
+		t.Fatalf("runS3Mode: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want 1 event from the late pre-midnight object, got %d", len(events))
+	}
+	if !newMark.Equal(lateMod) {
+		t.Errorf("newMark = %v, want %v", newMark, lateMod)
+	}
+}
