@@ -33,6 +33,11 @@ import (
 const (
 	cursorMaxLen = 2000
 	maxRetries   = 3
+
+	// legacyCursorFallback is the re-scan window used when an HMAC-valid
+	// cursor is found to carry a pre-highwater Link-header "next" URL
+	// instead of a timestamp. See run()'s cursor decode for the migration.
+	legacyCursorFallback = 24 * time.Hour
 )
 
 var cursorRE = regexp.MustCompile(`^[A-Za-z0-9+/=_\-]+$`)
@@ -87,6 +92,38 @@ func decodeCursor(encoded string, key []byte) (string, error) {
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return fmt.Sprintf("%x", h[:])
+}
+
+// resolveFloor decodes an optional checkpoint cursor and combines it with
+// --since to produce the effective query floor (the later of the two
+// timestamps wins). An HMAC-valid cursor whose payload does not parse as a
+// timestamp is a legacy pre-highwater pagination token: resolveFloor never
+// resumes it and never hard-fails on it — it self-heals by falling back to
+// legacyCursorFallback and reports legacy=true so the caller can log the
+// one-line warning. An HMAC-invalid (tampered) cursor still hard-fails.
+func resolveFloor(cursorArg string, sinceTime time.Time, key []byte) (floor time.Time, legacy bool, err error) {
+	var cursorMark time.Time
+	if cursorArg != "" {
+		raw, err := decodeCursor(cursorArg, key)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("invalid checkpoint cursor: %w", err)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			legacy = true
+			cursorMark = time.Now().UTC().Add(-legacyCursorFallback)
+		} else {
+			cursorMark = ts.UTC()
+		}
+	}
+
+	// When both --cursor and --since are supplied, the later (more recent)
+	// timestamp wins.
+	floor = sinceTime
+	if cursorMark.After(floor) {
+		floor = cursorMark
+	}
+	return floor, legacy, nil
 }
 
 // oktaLogEvent is a single Okta System Log entry (partial).
@@ -187,8 +224,7 @@ type connector struct {
 	client   *http.Client
 	domain   string
 	apiToken string
-	since    time.Time
-	nextURL  string // raw next URL from Link header
+	since    time.Time // effective query floor: max(--since, cursor high-water mark)
 }
 
 func (c *connector) get(ctx context.Context, rawURL string, params url.Values) (*http.Response, error) {
@@ -215,15 +251,25 @@ func (c *connector) get(ctx context.Context, rawURL string, params url.Values) (
 	return c.client.Do(req)
 }
 
-func (c *connector) fetchSystemLog(ctx context.Context) ([]*event.Event, string, error) {
+// fetchSystemLog pages the System Log to completion, following the Link
+// header's rel="next" URL within THIS run only, and returns every event plus
+// the maximum published timestamp among them. c.since seeds the request's
+// since= query param — the System Log API's own inclusive lower time bound
+// ("published >= since", per Okta's docs) — so a resumed run must never lose
+// an event sharing the exact high-water timestamp with the last emitted
+// event of the prior run; re-emitted boundary duplicates are dropped
+// downstream by mallcop core's per-ID dedupe (v0.11.3+). The connector never
+// persists or resumes the Link "next" URL across runs — it is a polling
+// cursor for THIS query only, not a checkpoint (mallcoppro-bb2).
+func (c *connector) fetchSystemLog(ctx context.Context) ([]*event.Event, time.Time, error) {
 	baseURL := fmt.Sprintf("https://%s/api/v1/logs", c.domain)
 	params := url.Values{"limit": {"1000"}}
-	if !c.since.IsZero() && c.nextURL == "" {
+	if !c.since.IsZero() {
 		params.Set("since", c.since.UTC().Format(time.RFC3339))
 	}
 
 	var allEvents []*event.Event
-	lastNextURL := ""
+	var maxSeen time.Time
 	currentURL := baseURL
 	isFirst := true
 
@@ -232,31 +278,26 @@ func (c *connector) fetchSystemLog(ctx context.Context) ([]*event.Event, string,
 		var err error
 
 		if isFirst {
-			if c.nextURL != "" {
-				// Resume from cursor (next URL already has params baked in).
-				resp, err = c.get(ctx, c.nextURL, nil)
-			} else {
-				resp, err = c.get(ctx, currentURL, params)
-			}
+			resp, err = c.get(ctx, currentURL, params)
 			isFirst = false
 		} else {
 			resp, err = c.get(ctx, currentURL, nil)
 		}
 
 		if err != nil {
-			return nil, "", fmt.Errorf("GET %s: %w", currentURL, err)
+			return nil, time.Time{}, fmt.Errorf("GET %s: %w", currentURL, err)
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
-			return nil, "", fmt.Errorf("rate limited by Okta API (429)")
+			return nil, time.Time{}, fmt.Errorf("rate limited by Okta API (429)")
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return nil, "", fmt.Errorf("Okta API error %d: %s", resp.StatusCode, string(body))
+			return nil, time.Time{}, fmt.Errorf("Okta API error %d: %s", resp.StatusCode, string(body))
 		}
 
 		linkHeader := resp.Header.Get("Link")
@@ -264,7 +305,7 @@ func (c *connector) fetchSystemLog(ctx context.Context) ([]*event.Event, string,
 		var entries []map[string]interface{}
 		if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
 			resp.Body.Close()
-			return nil, "", fmt.Errorf("decode response: %w", err)
+			return nil, time.Time{}, fmt.Errorf("decode response: %w", err)
 		}
 		resp.Body.Close()
 
@@ -275,17 +316,21 @@ func (c *connector) fetchSystemLog(ctx context.Context) ([]*event.Event, string,
 				continue
 			}
 			allEvents = append(allEvents, evs...)
+			for _, ev := range evs {
+				if ev.Timestamp.After(maxSeen) {
+					maxSeen = ev.Timestamp
+				}
+			}
 		}
 
 		next := parseNextLink(linkHeader)
 		if next == "" {
 			break
 		}
-		lastNextURL = next
 		currentURL = next
 	}
 
-	return allEvents, lastNextURL, nil
+	return allEvents, maxSeen, nil
 }
 
 func run() error {
@@ -315,25 +360,23 @@ func run() error {
 	}
 
 	key := sigKey(domain)
-	rawCursor := ""
-	if *cursorArg != "" {
-		var err error
-		rawCursor, err = decodeCursor(*cursorArg, key)
-		if err != nil {
-			return fmt.Errorf("invalid checkpoint cursor: %w", err)
-		}
+	floor, legacy, err := resolveFloor(*cursorArg, sinceTime, key)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		fmt.Fprintf(os.Stderr, "warn: legacy pagination-token cursor detected; discarding and re-scanning the last 24h\n")
 	}
 
 	conn := &connector{
 		client:   http.DefaultClient,
 		domain:   domain,
 		apiToken: apiToken,
-		since:    sinceTime,
-		nextURL:  rawCursor,
+		since:    floor,
 	}
 
 	ctx := context.Background()
-	events, nextURL, err := conn.fetchSystemLog(ctx)
+	events, maxSeen, err := conn.fetchSystemLog(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch system log: %w", err)
 	}
@@ -346,8 +389,10 @@ func run() error {
 		}
 	}
 
-	if nextURL != "" {
-		encoded := encodeCursor(nextURL, key)
+	// Only emit a cursor when at least one event was emitted this run; zero
+	// events means the caller should keep using its previous cursor.
+	if !maxSeen.IsZero() {
+		encoded := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
 		fmt.Fprintf(os.Stderr, "cursor: %s\n", encoded)
 	}
 

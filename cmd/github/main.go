@@ -30,11 +30,19 @@ import (
 )
 
 const (
-	apiBase      = "https://api.github.com"
 	cursorMaxLen = 1000
 	perPage      = "100"
 	maxRetries   = 3
+
+	// legacyCursorFallback is the re-scan window used when an HMAC-valid
+	// cursor is found to carry a pre-highwater "after" pagination token
+	// instead of a timestamp. See run()'s cursor decode for the migration.
+	legacyCursorFallback = 24 * time.Hour
 )
+
+// apiBase is a var (not const) so tests can point it at an httptest.Server
+// instead of the real GitHub API.
+var apiBase = "https://api.github.com"
 
 // cursorRE accepts base64 standard + URL-safe alphabet plus padding.
 var cursorRE = regexp.MustCompile(`^[A-Za-z0-9+/=_\-]+$`)
@@ -153,6 +161,38 @@ func sha256Digest(s string) []byte {
 	return h[:]
 }
 
+// resolveFloor decodes an optional checkpoint cursor and combines it with
+// --since to produce the effective query floor (the later of the two
+// timestamps wins). An HMAC-valid cursor whose payload does not parse as a
+// timestamp is a legacy pre-highwater pagination token: resolveFloor never
+// resumes it and never hard-fails on it — it self-heals by falling back to
+// legacyCursorFallback and reports legacy=true so the caller can log the
+// one-line warning. An HMAC-invalid (tampered) cursor still hard-fails.
+func resolveFloor(cursorArg string, sinceTime time.Time, key []byte) (floor time.Time, legacy bool, err error) {
+	var cursorMark time.Time
+	if cursorArg != "" {
+		raw, err := decodeCursor(cursorArg, key)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("invalid checkpoint cursor: %w", err)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			legacy = true
+			cursorMark = time.Now().UTC().Add(-legacyCursorFallback)
+		} else {
+			cursorMark = ts.UTC()
+		}
+	}
+
+	// When both --cursor and --since are supplied, the later (more recent)
+	// timestamp wins.
+	floor = sinceTime
+	if cursorMark.After(floor) {
+		floor = cursorMark
+	}
+	return floor, legacy, nil
+}
+
 // parseNextLink extracts the rel="next" URL from a GitHub Link header.
 func parseNextLink(linkHeader string) string {
 	if linkHeader == "" {
@@ -169,19 +209,6 @@ func parseNextLink(linkHeader string) string {
 		}
 	}
 	return ""
-}
-
-// parseAfterCursor extracts the "after" query param from a Link header next URL.
-func parseAfterCursor(linkHeader string) string {
-	nextURL := parseNextLink(linkHeader)
-	if nextURL == "" {
-		return ""
-	}
-	u, err := url.Parse(nextURL)
-	if err != nil {
-		return ""
-	}
-	return u.Query().Get("after")
 }
 
 // bearerTokenTransport is an http.RoundTripper that stamps every outbound
@@ -204,8 +231,7 @@ func (b *bearerTokenTransport) RoundTrip(r *http.Request) (*http.Response, error
 type connector struct {
 	client         *http.Client
 	org            string
-	since          time.Time
-	cursor         string // raw GitHub cursor
+	since          time.Time // effective floor: max(--since, cursor high-water mark)
 	appID          int64
 	installationID int64
 	out            io.Writer
@@ -289,20 +315,29 @@ func (c *connector) getWithRetry(ctx context.Context, rawURL string, params url.
 	}
 }
 
-func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, error) {
+// fetchAuditLog pages the org audit log to completion and returns every
+// event plus the maximum created_at timestamp among them. The audit log API
+// has no server-side time-range query param, so resume is entirely
+// client-side: entries come back newest-first, and once an entry's
+// timestamp is strictly before c.since (the effective floor — max of
+// --since and any decoded cursor high-water mark), every remaining entry on
+// this page and every subsequent page is also older, so we stop. Entries
+// exactly AT c.since are still included (inclusive boundary): a resumed run
+// must never lose an event sharing the exact high-water timestamp with the
+// last emitted event of the prior run, and re-emitted boundary duplicates
+// are dropped downstream by mallcop core's per-ID dedupe (v0.11.3+).
+//
+// The connector never sends GitHub's own "after" cursor across runs: it is
+// a one-shot continuation of a specific page of a specific request, and
+// because the audit log is newest-first, persisting it across runs walks
+// BACKWARD in time, missing every event newer than the token (mallcoppro-bb2).
+func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, time.Time, error) {
 	params := url.Values{"per_page": []string{perPage}}
-	if !c.since.IsZero() && c.cursor == "" {
-		// GitHub audit log doesn't directly support since; use cursor-based pagination.
-		// We'll filter by timestamp client-side when no cursor is provided.
-	}
-	if c.cursor != "" {
-		params.Set("after", c.cursor)
-	}
 
 	endpoint := fmt.Sprintf("%s/orgs/%s/audit-log", apiBase, c.org)
 
 	var allEvents []*event.Event
-	lastCursor := ""
+	var maxSeen time.Time
 	currentURL := endpoint
 	isFirst := true
 	pageCount := 0
@@ -322,13 +357,13 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, 
 			resp, err = c.getWithRetry(ctx, currentURL, nil)
 		}
 		if err != nil {
-			return nil, "", fmt.Errorf("GET %s: %w", currentURL, err)
+			return nil, time.Time{}, fmt.Errorf("GET %s: %w", currentURL, err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return nil, "", fmt.Errorf("GitHub API error %d: %s", resp.StatusCode, string(body))
+			return nil, time.Time{}, fmt.Errorf("GitHub API error %d: %s", resp.StatusCode, string(body))
 		}
 
 		var entries []auditLogEntry
@@ -337,12 +372,13 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, 
 		linkHeader := resp.Header.Get("Link")
 		resp.Body.Close()
 		if decErr != nil {
-			return nil, "", fmt.Errorf("decode response: %w", decErr)
+			return nil, time.Time{}, fmt.Errorf("decode response: %w", decErr)
 		}
 
-		// Track whether any entry on this page is newer than --since.
+		// Track whether any entry on this page is older than the floor.
 		// GitHub returns entries newest-first, so once we see an entry older
-		// than --since, all subsequent pages will also be older — stop paginating.
+		// than the floor, all subsequent entries (and pages) will also be
+		// older — stop paginating.
 		pageExhausted := false
 		for _, entry := range entries {
 			if !c.since.IsZero() {
@@ -372,14 +408,12 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, 
 				continue
 			}
 			allEvents = append(allEvents, ev)
+			if ev.Timestamp.After(maxSeen) {
+				maxSeen = ev.Timestamp
+			}
 		}
 		if pageExhausted {
 			break
-		}
-
-		// Extract cursor from Link header.
-		if after := parseAfterCursor(linkHeader); after != "" {
-			lastCursor = after
 		}
 
 		// Follow pagination.
@@ -390,7 +424,7 @@ func (c *connector) fetchAuditLog(ctx context.Context) ([]*event.Event, string, 
 		currentURL = next
 	}
 
-	return allEvents, lastCursor, nil
+	return allEvents, maxSeen, nil
 }
 
 func run() error {
@@ -434,13 +468,18 @@ func run() error {
 
 	// Decode and validate cursor if provided.
 	key := sigKey(*appID, *installationID)
-	rawCursor := ""
-	if *cursor != "" {
-		var err error
-		rawCursor, err = decodeCursor(*cursor, key)
-		if err != nil {
-			return fmt.Errorf("invalid checkpoint cursor: %w", err)
-		}
+	floor, legacy, err := resolveFloor(*cursor, sinceTime, key)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		// Legacy pre-highwater cursor: an HMAC-valid "after" pagination
+		// token, not a timestamp. Never resumed (an "after" token is a
+		// one-shot continuation of a now-stale query, and the audit log is
+		// newest-first — persisting it would walk backward in time) and
+		// never hard-failed on either — self-healed by re-scanning a fixed
+		// lookback window. Tampered (HMAC-invalid) cursors still hard-fail.
+		fmt.Fprintf(os.Stderr, "warn: legacy pagination-token cursor detected; discarding and re-scanning the last 24h\n")
 	}
 
 	// Set up the authenticated HTTP client. Two paths:
@@ -471,15 +510,14 @@ func run() error {
 	conn := &connector{
 		client:         httpClient,
 		org:            *org,
-		since:          sinceTime,
-		cursor:         rawCursor,
+		since:          floor,
 		appID:          *appID,
 		installationID: *installationID,
 		out:            os.Stdout,
 	}
 
 	ctx := context.Background()
-	events, nextRawCursor, err := conn.fetchAuditLog(ctx)
+	events, maxSeen, err := conn.fetchAuditLog(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch audit log: %w", err)
 	}
@@ -493,8 +531,10 @@ func run() error {
 	}
 
 	// Emit checkpoint cursor to stderr so it can be captured separately.
-	if nextRawCursor != "" {
-		encodedCursor := encodeCursor(nextRawCursor, key)
+	// Only when at least one event was emitted this run; zero events means
+	// the caller should keep using its previous cursor.
+	if !maxSeen.IsZero() {
+		encodedCursor := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
 		fmt.Fprintf(os.Stderr, "cursor: %s\n", encodedCursor)
 	}
 

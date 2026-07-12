@@ -33,9 +33,17 @@ import (
 const (
 	cursorMaxLen    = 2000
 	tokenEndpointFn = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"
-	activityLogBase = "https://management.azure.com/subscriptions/%s/providers/microsoft.insights/eventtypes/management/values"
 	apiVersion      = "2015-04-01"
+
+	// legacyCursorFallback is the re-scan window used when an HMAC-valid
+	// cursor is found to carry a pre-highwater pagination token (nextLink)
+	// instead of a timestamp. See run()'s cursor decode for the migration.
+	legacyCursorFallback = 24 * time.Hour
 )
+
+// activityLogBase is a var (not const) so tests can point it at an
+// httptest.Server instead of the real Azure management endpoint.
+var activityLogBase = "https://management.azure.com/subscriptions/%s/providers/microsoft.insights/eventtypes/management/values"
 
 var cursorRE = regexp.MustCompile(`^[A-Za-z0-9+/=_\-&?%:.]+$`)
 
@@ -86,6 +94,38 @@ func decodeCursor(encoded string, key []byte) (string, error) {
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return fmt.Sprintf("%x", h[:])
+}
+
+// resolveFloor decodes an optional checkpoint cursor and combines it with
+// --since to produce the effective query floor (the later of the two
+// timestamps wins). An HMAC-valid cursor whose payload does not parse as a
+// timestamp is a legacy pre-highwater pagination token: resolveFloor never
+// resumes it and never hard-fails on it — it self-heals by falling back to
+// legacyCursorFallback and reports legacy=true so the caller can log the
+// one-line warning. An HMAC-invalid (tampered) cursor still hard-fails.
+func resolveFloor(cursorArg string, sinceTime time.Time, key []byte) (floor time.Time, legacy bool, err error) {
+	var cursorMark time.Time
+	if cursorArg != "" {
+		raw, err := decodeCursor(cursorArg, key)
+		if err != nil {
+			return time.Time{}, false, fmt.Errorf("invalid checkpoint cursor: %w", err)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			legacy = true
+			cursorMark = time.Now().UTC().Add(-legacyCursorFallback)
+		} else {
+			cursorMark = ts.UTC()
+		}
+	}
+
+	// When both --cursor and --since are supplied, the later (more recent)
+	// timestamp wins.
+	floor = sinceTime
+	if cursorMark.After(floor) {
+		floor = cursorMark
+	}
+	return floor, legacy, nil
 }
 
 type azureTokenResponse struct {
@@ -203,8 +243,7 @@ type connector struct {
 	client         *http.Client
 	accessToken    string
 	subscriptionID string
-	since          time.Time
-	nextLink       string // raw nextLink cursor
+	since          time.Time // effective query floor: max(--since, cursor high-water mark)
 }
 
 func (c *connector) get(ctx context.Context, rawURL string) (*http.Response, error) {
@@ -217,41 +256,46 @@ func (c *connector) get(ctx context.Context, rawURL string) (*http.Response, err
 	return c.client.Do(req)
 }
 
-func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, string, error) {
-	var firstURL string
-	if c.nextLink != "" {
-		// Resume from cursor.
-		firstURL = c.nextLink
-	} else {
-		u := fmt.Sprintf(activityLogBase, c.subscriptionID)
-		params := url.Values{"api-version": {apiVersion}}
-		if !c.since.IsZero() {
-			filter := fmt.Sprintf("eventTimestamp ge '%s'", c.since.UTC().Format(time.RFC3339))
-			params.Set("$filter", filter)
-		}
-		firstURL = u + "?" + params.Encode()
+// fetchActivityLog runs the Activity Log query to full pagination completion
+// (following NextLink until exhausted) and returns every event plus the
+// maximum eventTimestamp among them. It always starts a fresh query anchored
+// on c.since ($filter eventTimestamp ge <floor>, server-side and inclusive)
+// rather than resuming a prior run's NextLink: NextLink is a one-shot
+// continuation of THAT query and is never safe to persist across runs (see
+// mallcoppro-bb2). The returned max timestamp is what run() turns into the
+// next cursor.
+func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, time.Time, error) {
+	u := fmt.Sprintf(activityLogBase, c.subscriptionID)
+	params := url.Values{"api-version": {apiVersion}}
+	if !c.since.IsZero() {
+		// Inclusive ("ge", not "gt"): a resumed run must never lose an event
+		// that shares the exact high-water timestamp with the last emitted
+		// event of the prior run. Re-emitted boundary duplicates are dropped
+		// downstream by mallcop core's per-ID dedupe (v0.11.3+).
+		filter := fmt.Sprintf("eventTimestamp ge '%s'", c.since.UTC().Format(time.RFC3339))
+		params.Set("$filter", filter)
 	}
+	currentURL := u + "?" + params.Encode()
 
 	var allEvents []*event.Event
-	lastNextLink := ""
-	currentURL := firstURL
+	var maxSeen time.Time
 
 	for {
 		resp, err := c.get(ctx, currentURL)
 		if err != nil {
-			return nil, "", fmt.Errorf("GET %s: %w", currentURL, err)
+			return nil, time.Time{}, fmt.Errorf("GET %s: %w", currentURL, err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return nil, "", fmt.Errorf("Azure API error %d: %s", resp.StatusCode, string(body))
+			return nil, time.Time{}, fmt.Errorf("Azure API error %d: %s", resp.StatusCode, string(body))
 		}
 
 		var result activityLogResponse
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			resp.Body.Close()
-			return nil, "", fmt.Errorf("decode response: %w", err)
+			return nil, time.Time{}, fmt.Errorf("decode response: %w", err)
 		}
 		resp.Body.Close()
 
@@ -262,16 +306,20 @@ func (c *connector) fetchActivityLog(ctx context.Context) ([]*event.Event, strin
 				continue
 			}
 			allEvents = append(allEvents, evs...)
+			for _, ev := range evs {
+				if ev.Timestamp.After(maxSeen) {
+					maxSeen = ev.Timestamp
+				}
+			}
 		}
 
 		if result.NextLink == "" {
 			break
 		}
-		lastNextLink = result.NextLink
 		currentURL = result.NextLink
 	}
 
-	return allEvents, lastNextLink, nil
+	return allEvents, maxSeen, nil
 }
 
 func run() error {
@@ -306,13 +354,12 @@ func run() error {
 	}
 
 	key := sigKey(*subscriptionID)
-	rawCursor := ""
-	if *cursorArg != "" {
-		var err error
-		rawCursor, err = decodeCursor(*cursorArg, key)
-		if err != nil {
-			return fmt.Errorf("invalid checkpoint cursor: %w", err)
-		}
+	floor, legacy, err := resolveFloor(*cursorArg, sinceTime, key)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		fmt.Fprintf(os.Stderr, "warn: legacy pagination-token cursor detected; discarding and re-scanning the last 24h\n")
 	}
 
 	token, err := getAccessToken(tenantID, clientID, clientSecret)
@@ -324,12 +371,11 @@ func run() error {
 		client:         http.DefaultClient,
 		accessToken:    token,
 		subscriptionID: *subscriptionID,
-		since:          sinceTime,
-		nextLink:       rawCursor,
+		since:          floor,
 	}
 
 	ctx := context.Background()
-	events, nextLink, err := conn.fetchActivityLog(ctx)
+	events, maxSeen, err := conn.fetchActivityLog(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch activity log: %w", err)
 	}
@@ -342,8 +388,10 @@ func run() error {
 		}
 	}
 
-	if nextLink != "" {
-		encoded := encodeCursor(nextLink, key)
+	// Only emit a cursor when at least one event was emitted this run; zero
+	// events means the caller should keep using its previous cursor.
+	if !maxSeen.IsZero() {
+		encoded := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
 		fmt.Fprintf(os.Stderr, "cursor: %s\n", encoded)
 	}
 

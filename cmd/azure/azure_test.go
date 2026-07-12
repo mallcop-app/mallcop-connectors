@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +12,15 @@ import (
 	"github.com/mallcop-app/mallcop-connectors/internal/normalize"
 	"github.com/mallcop-app/mallcop-connectors/pkg/event"
 )
+
+// activityLogBaseOverride points the package-level activityLogBase var at a
+// test server for the duration of the returned restore func (mirrors
+// mercury's apiBaseOverride idiom in cmd/mercury/mercury_test.go).
+func activityLogBaseOverride(serverURL string) func() {
+	orig := activityLogBase
+	activityLogBase = serverURL + "/subscriptions/%s/providers/microsoft.insights/eventtypes/management/values"
+	return func() { activityLogBase = orig }
+}
 
 func TestCursorRoundtrip(t *testing.T) {
 	key := sigKey("sub-12345")
@@ -181,5 +193,165 @@ func TestNormalizeEntrySchemaRoundtrip(t *testing.T) {
 	}
 	if decoded.Source != "azure" {
 		t.Errorf("Source mismatch: %q", decoded.Source)
+	}
+}
+
+// --- mallcoppro-bb2: high-water cursor semantics ---
+
+func serveActivityLogPages(t *testing.T, pages [][]map[string]interface{}) *httptest.Server {
+	t.Helper()
+	call := 0
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if call >= len(pages) {
+			t.Fatalf("unexpected extra request %d (only %d pages configured)", call+1, len(pages))
+		}
+		resp := activityLogResponse{Value: pages[call]}
+		call++
+		if call < len(pages) {
+			// Point NextLink back at this same server; the real per-run
+			// pagination loop should follow it to completion, but it must
+			// NEVER be what a resumed run starts from (see run()).
+			resp.NextLink = "http://" + r.Host + "/next-page"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+// (a) complete pagination emits a cursor whose decoded payload is the max
+// emitted event timestamp (RFC3339Nano), NOT a pagination token.
+func TestFetchActivityLogCompletePaginationHighWaterCursor(t *testing.T) {
+	page1 := []map[string]interface{}{
+		{"id": "1", "eventTimestamp": "2024-06-01T12:00:00Z", "caller": "a@example.com"},
+	}
+	page2 := []map[string]interface{}{
+		{"id": "2", "eventTimestamp": "2024-06-01T13:30:00.123Z", "caller": "b@example.com"},
+	}
+	srv := serveActivityLogPages(t, [][]map[string]interface{}{page1, page2})
+	defer srv.Close()
+	defer activityLogBaseOverride(srv.URL)()
+
+	conn := &connector{client: srv.Client(), accessToken: "tok", subscriptionID: "sub-hw"}
+	events, maxSeen, err := conn.fetchActivityLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchActivityLog: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 events (full pagination), got %d", len(events))
+	}
+	want := time.Date(2024, 6, 1, 13, 30, 0, 123000000, time.UTC)
+	if !maxSeen.Equal(want) {
+		t.Fatalf("maxSeen = %v, want %v", maxSeen, want)
+	}
+
+	key := sigKey("sub-hw")
+	encoded := encodeCursor(maxSeen.UTC().Format(time.RFC3339Nano), key)
+	decoded, err := decodeCursor(encoded, key)
+	if err != nil {
+		t.Fatalf("decodeCursor: %v", err)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, decoded)
+	if err != nil {
+		t.Fatalf("cursor payload is not a timestamp (looks like a pagination token): %v", err)
+	}
+	if !parsed.Equal(want) {
+		t.Errorf("cursor payload = %v, want %v", parsed, want)
+	}
+}
+
+// (b) resume with a timestamp cursor queries from that timestamp
+// inclusively — assert the actual $filter request parameter reflects T.
+func TestFetchActivityLogResumeUsesInclusiveFilter(t *testing.T) {
+	var gotFilter string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotFilter = r.URL.Query().Get("$filter")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(activityLogResponse{})
+	}))
+	defer srv.Close()
+	defer activityLogBaseOverride(srv.URL)()
+
+	floor := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	conn := &connector{client: srv.Client(), accessToken: "tok", subscriptionID: "sub-resume", since: floor}
+	if _, _, err := conn.fetchActivityLog(context.Background()); err != nil {
+		t.Fatalf("fetchActivityLog: %v", err)
+	}
+
+	want := `eventTimestamp ge '2024-06-01T12:00:00Z'`
+	if gotFilter != want {
+		t.Errorf("$filter = %q, want %q (must be inclusive \"ge\", not exclusive)", gotFilter, want)
+	}
+}
+
+// (c) a legacy pagination-token cursor (HMAC-valid, non-timestamp payload)
+// warns and falls back to the 24h window — the run SUCCEEDS.
+func TestResolveFloorLegacyPaginationTokenFallsBack(t *testing.T) {
+	key := sigKey("sub-legacy")
+	legacyCursor := encodeCursor("https://management.azure.com/subscriptions/sub-legacy?$skiptoken=abc123", key)
+
+	before := time.Now().UTC()
+	floor, legacy, err := resolveFloor(legacyCursor, time.Time{}, key)
+	after := time.Now().UTC()
+	if err != nil {
+		t.Fatalf("resolveFloor: legacy cursor must not hard-fail, got: %v", err)
+	}
+	if !legacy {
+		t.Error("legacy = false, want true for a non-timestamp HMAC-valid payload")
+	}
+	wantMin := before.Add(-legacyCursorFallback)
+	wantMax := after.Add(-legacyCursorFallback)
+	if floor.Before(wantMin) || floor.After(wantMax) {
+		t.Errorf("floor = %v, want within [%v, %v] (now - 24h)", floor, wantMin, wantMax)
+	}
+
+	// Prove the run actually succeeds end-to-end with the fallback floor.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(activityLogResponse{})
+	}))
+	defer srv.Close()
+	defer activityLogBaseOverride(srv.URL)()
+
+	conn := &connector{client: srv.Client(), accessToken: "tok", subscriptionID: "sub-legacy", since: floor}
+	if _, _, err := conn.fetchActivityLog(context.Background()); err != nil {
+		t.Fatalf("fetchActivityLog after legacy-cursor fallback: %v", err)
+	}
+}
+
+// (d) zero events emitted -> caller (run()) must not print a "cursor:" line.
+// fetchActivityLog itself signals this via a zero maxSeen.
+func TestFetchActivityLogZeroEventsNoCursor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(activityLogResponse{})
+	}))
+	defer srv.Close()
+	defer activityLogBaseOverride(srv.URL)()
+
+	conn := &connector{client: srv.Client(), accessToken: "tok", subscriptionID: "sub-empty"}
+	events, maxSeen, err := conn.fetchActivityLog(context.Background())
+	if err != nil {
+		t.Fatalf("fetchActivityLog: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("want 0 events, got %d", len(events))
+	}
+	if !maxSeen.IsZero() {
+		t.Errorf("maxSeen = %v, want zero (no cursor should be emitted)", maxSeen)
+	}
+}
+
+// (e) a tampered (HMAC-invalid) cursor still hard-fails.
+func TestResolveFloorTamperedCursorHardFails(t *testing.T) {
+	key := sigKey("sub-tamper")
+	encoded := encodeCursor("2024-06-01T12:00:00Z", key)
+	parts := strings.SplitN(encoded, ".", 2)
+	payload := []byte(parts[0])
+	payload[len(payload)-1] ^= 0x01
+	tampered := string(payload) + "." + parts[1]
+
+	_, _, err := resolveFloor(tampered, time.Time{}, key)
+	if err == nil {
+		t.Fatal("expected hard failure for tampered cursor, got nil")
 	}
 }
