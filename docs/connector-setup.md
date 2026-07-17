@@ -8,6 +8,7 @@ same env vars work anywhere `mallcop scan` runs.
 - [How connectors work](#how-connectors-work)
 - [Prerequisite: install the sibling binaries](#prerequisite-install-the-sibling-binaries-kindcloud-only)
 - [GitHub](#github) · [Azure](#azure) · [AWS](#aws) · [GuardDuty](#guardduty) · [Microsoft 365](#microsoft-365) · [GCP](#gcp) · [Okta](#okta)
+- [GitHub](#github) · [Azure](#azure) · [AWS](#aws) · [CloudWatch](#cloudwatch) · [Microsoft 365](#microsoft-365) · [GCP](#gcp) · [Okta](#okta)
 - [Cost & tuning](#cost--tuning) · [Verifying a connector](#verifying-a-connector)
 
 ---
@@ -21,6 +22,7 @@ A scan's sources are the `connectors:` list in `mallcop.yaml`. Three kinds:
 | `file` | reads a local events JSONL | no (built in) |
 | `github` | in-process GitHub org connector | no (built into the mallcop binary) |
 | `cloud` | forks a sibling binary `mallcop-connector-<source>` | **yes** — from this repo (`aws`, `azure`, `gcp`, `guardduty`, `m365`, `okta`) |
+| `cloud` | forks a sibling binary `mallcop-connector-<source>` | **yes** — from this repo (`aws`, `azure`, `cloudwatch`, `gcp`, `m365`, `okta`) |
 
 Key behaviours to design around:
 
@@ -270,6 +272,29 @@ list-detectors --region <region>` → `200` with either a populated or empty
 `detectorIds` list. An empty list means GuardDuty isn't enabled yet — wiring the
 connector is still safe (see the callout above), you just won't see findings until
 someone enables it.
+## CloudWatch
+**Monitors:** AWS **CloudWatch alarm state transitions** (`DescribeAlarms` +
+`DescribeAlarmHistory`, `HistoryItemType=StateUpdate`) — an **alert stream**, not raw
+activity: every emitted event is a `cloudwatch_alarm` with `signal_class: "alert"`,
+one per alarm crossing into or out of `ALARM`/`INSUFFICIENT_DATA`/`OK`. This is mallcop
+acting as the free triage/investigation layer over alerts your monitoring already
+raised — the alarms themselves still need to exist (this connector reads them, it does
+not create or tune them). `kind: cloud, source: cloudwatch`.
+**Credentials — reuses the same `mallcop-monitor` OIDC role as the `aws` connector**
+(add the two permissions below to that role's policy; no second role needed):
+  "Action": ["cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmHistory"],
+Both calls are free and strictly read-only.
+**scan.yml** — the same `Configure AWS credentials (OIDC)` step the `aws` connector
+uses covers this connector too; no extra step needed if `aws` is already wired.
+**`mallcop.yaml`:**
+    id: cloudwatch-myaccount
+    source: cloudwatch
+    binary: connectors/bin/cloudwatch
+Include `AWS_SESSION_TOKEN` in `env:` for the same reason the `aws` entry does — OIDC
+credentials are temporary and won't authenticate without it.
+**Verify (zero cost):** `aws cloudwatch describe-alarms --max-records 1` with the same
+credential — a `200` (even with zero alarms) proves the credential and its scope. Zero
+alarms or zero history is a legitimate, fully-supported empty result, not an error.
 
 ---
 
