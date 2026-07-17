@@ -76,6 +76,19 @@ var credentialKeys = map[string]bool{
 // scalars — the shape every connector's "raw" argument arrives in) and
 // returns a copy with any object key in credentialKeys, at any depth,
 // replaced by redactedValue. Non-container values pass through unchanged.
+//
+// One key is special-cased: "CloudTrailEvent". AWS's LookupEvents API (the
+// default aws connector path, cmd/aws/main.go) returns each event with its
+// inner CloudTrail record still JSON-encoded as a STRING under that key —
+// unlike the S3 org-trail path, which hands us the record already decoded.
+// A plain map/slice walk never looks inside a string, so
+// responseElements.credentials.sessionToken would sail through unredacted
+// and land verbatim in the customer's findings git branch. When we see
+// "CloudTrailEvent" holding a string, we decode it, redact the decoded
+// doc recursively, and re-encode it back into a string so the payload shape
+// callers expect is preserved. We do NOT attempt this for any other string
+// key — re-encoding an arbitrary string that happens to parse as JSON would
+// silently reorder/reformat payload bytes that consumers may hash or compare.
 func redactCredentials(v any) any {
 	switch val := v.(type) {
 	case map[string]any:
@@ -84,6 +97,12 @@ func redactCredentials(v any) any {
 			if credentialKeys[strings.ToLower(k)] {
 				out[k] = redactedValue
 				continue
+			}
+			if strings.EqualFold(k, "CloudTrailEvent") {
+				if s, ok := sub.(string); ok {
+					out[k] = redactCloudTrailEventString(s)
+					continue
+				}
 			}
 			out[k] = redactCredentials(sub)
 		}
@@ -97,6 +116,23 @@ func redactCredentials(v any) any {
 	default:
 		return v
 	}
+}
+
+// redactCloudTrailEventString decodes s as JSON, redacts credential material
+// anywhere in the decoded document, and re-marshals it compactly. If s does
+// not parse as JSON, it is returned unchanged — we never mangle a string that
+// isn't actually an encoded CloudTrail record.
+func redactCloudTrailEventString(s string) string {
+	var doc any
+	if err := json.Unmarshal([]byte(s), &doc); err != nil {
+		return s
+	}
+	redacted := redactCredentials(doc)
+	b, err := json.Marshal(redacted)
+	if err != nil {
+		return s
+	}
+	return string(b)
 }
 
 // --- shared accessors over decoded JSON maps -------------------------------

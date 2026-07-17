@@ -2,6 +2,7 @@ package normalize
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -448,5 +449,77 @@ func TestPayloadRedactsCredentialsAtAnyDepth(t *testing.T) {
 	}
 	if deeper["accessKeyId"] != "AKIAIOSFODNN7EXAMPLE" {
 		t.Errorf("accessKeyId = %v, want preserved", deeper["accessKeyId"])
+	}
+}
+
+// The DEFAULT aws connector path (cmd/aws/main.go LookupEvents mode) builds
+// rawMap with "CloudTrailEvent" as a STRING holding the full inner CloudTrail
+// JSON document — not an already-decoded map, unlike the S3 org-trail path
+// covered by TestPayloadRedactsAssumeRoleCredentials above. Prove the string
+// is decoded, redacted, and re-encoded rather than passed through verbatim.
+func TestPayloadRedactsCredentialsInsideCloudTrailEventString(t *testing.T) {
+	inner := `{"eventName":"AssumeRole","responseElements":{"credentials":{` +
+		`"accessKeyId":"ASIAEXAMPLE","sessionToken":"FQoGZXIvYXdzEXAMPLETOKEN",` +
+		`"expiration":"Jul 17, 2026 1:00:00 PM"}}}`
+	rawMap := map[string]any{"CloudTrailEvent": inner}
+
+	r := Result{Type: "role_assignment", Payload: map[string]any{"action": "AssumeRole"}}
+	b, err := r.PayloadJSON(rawMap)
+	if err != nil {
+		t.Fatalf("PayloadJSON: %v", err)
+	}
+
+	if strings.Contains(string(b), "FQoGZXIvYXdzEXAMPLETOKEN") {
+		t.Fatalf("stored payload leaks live session token: %s", b)
+	}
+	if !strings.Contains(string(b), redactedValue) {
+		t.Fatalf("stored payload missing %q: %s", redactedValue, b)
+	}
+
+	var p map[string]any
+	if err := json.Unmarshal(b, &p); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	rawOut, ok := p["raw"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw not a map: %T", p["raw"])
+	}
+	cteStr, ok := rawOut["CloudTrailEvent"].(string)
+	if !ok {
+		t.Fatalf("CloudTrailEvent not a string: %T", rawOut["CloudTrailEvent"])
+	}
+
+	var innerDoc map[string]any
+	if err := json.Unmarshal([]byte(cteStr), &innerDoc); err != nil {
+		t.Fatalf("re-encoded CloudTrailEvent not valid JSON: %v (%s)", err, cteStr)
+	}
+	creds := dig(innerDoc, "responseElements", "credentials")
+	if creds == nil {
+		t.Fatalf("responseElements.credentials missing from redacted inner doc: %+v", innerDoc)
+	}
+	if creds["sessionToken"] != redactedValue {
+		t.Errorf("sessionToken = %v, want %q", creds["sessionToken"], redactedValue)
+	}
+	if creds["accessKeyId"] != "ASIAEXAMPLE" {
+		t.Errorf("accessKeyId = %v, want preserved", creds["accessKeyId"])
+	}
+	if creds["expiration"] != "Jul 17, 2026 1:00:00 PM" {
+		t.Errorf("expiration = %v, want preserved", creds["expiration"])
+	}
+}
+
+// A CloudTrailEvent string that isn't valid JSON must pass through unchanged
+// rather than being dropped or mangled.
+func TestPayloadCloudTrailEventNonJSONPassesThrough(t *testing.T) {
+	rawMap := map[string]any{"CloudTrailEvent": "not json at all"}
+	r := Result{Type: "cloud_other", Payload: map[string]any{"action": "x"}}
+	p := decode(t, r, rawMap)
+
+	rawOut, ok := p["raw"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw not a map: %T", p["raw"])
+	}
+	if rawOut["CloudTrailEvent"] != "not json at all" {
+		t.Errorf("CloudTrailEvent = %v, want unchanged", rawOut["CloudTrailEvent"])
 	}
 }
