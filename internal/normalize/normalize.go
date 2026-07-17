@@ -21,7 +21,10 @@
 // secrets-exposure still scan every original string recursively.
 package normalize
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // CatchAll is the inert event type emitted for raw events not in any per-cloud
 // mapping table. It gates no detector, so unmapped events still flow to the
@@ -51,7 +54,85 @@ func (r Result) PayloadJSON(raw any) (json.RawMessage, error) {
 	if _, ok := p["raw"]; !ok {
 		p["raw"] = raw
 	}
+	// Credential material (STS session tokens, secret keys) must never persist
+	// verbatim in a stored payload — it ends up committed to the customer's
+	// findings git branch. Scrub before it gets anywhere near json.Marshal.
+	p["raw"] = redactCredentials(p["raw"])
 	return json.Marshal(p)
+}
+
+// redactedValue replaces credential material found by redactCredentials.
+const redactedValue = "[REDACTED]"
+
+// credentialKeys are object keys (matched case-insensitively) whose values are
+// live credential material and must never be stored verbatim. accessKeyId and
+// expiration are identifiers, not secrets, and are deliberately left alone.
+var credentialKeys = map[string]bool{
+	"sessiontoken":    true,
+	"secretaccesskey": true,
+}
+
+// redactCredentials walks a decoded JSON value (map[string]any / []any /
+// scalars — the shape every connector's "raw" argument arrives in) and
+// returns a copy with any object key in credentialKeys, at any depth,
+// replaced by redactedValue. Non-container values pass through unchanged.
+//
+// One key is special-cased: "CloudTrailEvent". AWS's LookupEvents API (the
+// default aws connector path, cmd/aws/main.go) returns each event with its
+// inner CloudTrail record still JSON-encoded as a STRING under that key —
+// unlike the S3 org-trail path, which hands us the record already decoded.
+// A plain map/slice walk never looks inside a string, so
+// responseElements.credentials.sessionToken would sail through unredacted
+// and land verbatim in the customer's findings git branch. When we see
+// "CloudTrailEvent" holding a string, we decode it, redact the decoded
+// doc recursively, and re-encode it back into a string so the payload shape
+// callers expect is preserved. We do NOT attempt this for any other string
+// key — re-encoding an arbitrary string that happens to parse as JSON would
+// silently reorder/reformat payload bytes that consumers may hash or compare.
+func redactCredentials(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, sub := range val {
+			if credentialKeys[strings.ToLower(k)] {
+				out[k] = redactedValue
+				continue
+			}
+			if strings.EqualFold(k, "CloudTrailEvent") {
+				if s, ok := sub.(string); ok {
+					out[k] = redactCloudTrailEventString(s)
+					continue
+				}
+			}
+			out[k] = redactCredentials(sub)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, sub := range val {
+			out[i] = redactCredentials(sub)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// redactCloudTrailEventString decodes s as JSON, redacts credential material
+// anywhere in the decoded document, and re-marshals it compactly. If s does
+// not parse as JSON, it is returned unchanged — we never mangle a string that
+// isn't actually an encoded CloudTrail record.
+func redactCloudTrailEventString(s string) string {
+	var doc any
+	if err := json.Unmarshal([]byte(s), &doc); err != nil {
+		return s
+	}
+	redacted := redactCredentials(doc)
+	b, err := json.Marshal(redacted)
+	if err != nil {
+		return s
+	}
+	return string(b)
 }
 
 // --- shared accessors over decoded JSON maps -------------------------------
