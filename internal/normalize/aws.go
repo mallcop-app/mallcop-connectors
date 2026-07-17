@@ -186,8 +186,16 @@ func AWS(eventName string, rawEvent map[string]any) []Result {
 	case "AssumeRole", "AssumeRoleWithSAML", "AssumeRoleWithWebIdentity":
 		roleArn := mapStr(reqParams, "roleArn")
 		acct := arnAccountID(roleArn)
+		userIdentity := subMap(inner, "userIdentity")
+		caller := firstNonEmpty(mapStr(userIdentity, "arn"), mapStr(userIdentity, "principalId"))
+		sessionName := mapStr(reqParams, "roleSessionName")
 		p := map[string]any{"action": "AssumeRole"}
 		set(p, "member", roleArn)
+		// Caller identity so "who did it" is answerable without opening raw.
+		set(p, "caller", caller)
+		set(p, "session_name", sessionName)
+		set(p, "source_ip", sourceIP)
+		set(p, "target", roleArn)
 		// Cross-account: the assumed role belongs to a different account than home.
 		if acct != "" && recipientAcct != "" && acct != recipientAcct {
 			set(p, "domain", acct)

@@ -21,7 +21,10 @@
 // secrets-exposure still scan every original string recursively.
 package normalize
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // CatchAll is the inert event type emitted for raw events not in any per-cloud
 // mapping table. It gates no detector, so unmapped events still flow to the
@@ -51,7 +54,49 @@ func (r Result) PayloadJSON(raw any) (json.RawMessage, error) {
 	if _, ok := p["raw"]; !ok {
 		p["raw"] = raw
 	}
+	// Credential material (STS session tokens, secret keys) must never persist
+	// verbatim in a stored payload — it ends up committed to the customer's
+	// findings git branch. Scrub before it gets anywhere near json.Marshal.
+	p["raw"] = redactCredentials(p["raw"])
 	return json.Marshal(p)
+}
+
+// redactedValue replaces credential material found by redactCredentials.
+const redactedValue = "[REDACTED]"
+
+// credentialKeys are object keys (matched case-insensitively) whose values are
+// live credential material and must never be stored verbatim. accessKeyId and
+// expiration are identifiers, not secrets, and are deliberately left alone.
+var credentialKeys = map[string]bool{
+	"sessiontoken":    true,
+	"secretaccesskey": true,
+}
+
+// redactCredentials walks a decoded JSON value (map[string]any / []any /
+// scalars — the shape every connector's "raw" argument arrives in) and
+// returns a copy with any object key in credentialKeys, at any depth,
+// replaced by redactedValue. Non-container values pass through unchanged.
+func redactCredentials(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, sub := range val {
+			if credentialKeys[strings.ToLower(k)] {
+				out[k] = redactedValue
+				continue
+			}
+			out[k] = redactCredentials(sub)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, sub := range val {
+			out[i] = redactCredentials(sub)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // --- shared accessors over decoded JSON maps -------------------------------

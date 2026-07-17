@@ -86,12 +86,67 @@ func TestAWSGetObjectExfilFields(t *testing.T) {
 func TestAWSAssumeRoleCrossAccountTrust(t *testing.T) {
 	raw := map[string]any{
 		"CloudTrailEvent": `{"recipientAccountId":"111111111111",
-			"requestParameters":{"roleArn":"arn:aws:iam::222222222222:role/cross"}}`,
+			"sourceIPAddress":"203.0.113.5",
+			"userIdentity":{"type":"IAMUser","principalId":"AIDACKCEVSQ6C2EXAMPLE",
+				"arn":"arn:aws:iam::111111111111:user/alice","accountId":"111111111111",
+				"accessKeyId":"AKIAIOSFODNN7EXAMPLE","userName":"alice"},
+			"requestParameters":{"roleArn":"arn:aws:iam::222222222222:role/cross",
+				"roleSessionName":"alice-session"},
+			"responseElements":{"credentials":{"accessKeyId":"ASIAEXAMPLE",
+				"sessionToken":"FQoGZXIvYXdzEXAMPLETOKEN","expiration":"Jul 17, 2026 1:00:00 PM"}}}`,
 	}
 	r := wantType(t, AWS("AssumeRole", raw), "trust_added")
 	p := decode(t, r, raw)
 	if p["domain"] != "222222222222" {
 		t.Errorf("domain = %v", p["domain"])
+	}
+	if p["external_user"] != "111111111111" {
+		t.Errorf("external_user = %v", p["external_user"])
+	}
+	if p["member"] != "arn:aws:iam::222222222222:role/cross" {
+		t.Errorf("member = %v", p["member"])
+	}
+	if p["caller"] != "arn:aws:iam::111111111111:user/alice" {
+		t.Errorf("caller = %v", p["caller"])
+	}
+	if p["session_name"] != "alice-session" {
+		t.Errorf("session_name = %v", p["session_name"])
+	}
+	if p["source_ip"] != "203.0.113.5" {
+		t.Errorf("source_ip = %v", p["source_ip"])
+	}
+	if p["target"] != "arn:aws:iam::222222222222:role/cross" {
+		t.Errorf("target = %v", p["target"])
+	}
+}
+
+// Same-account assume: caller identity must still be promoted onto
+// role_assignment, and the caller fallback (userIdentity.principalId, used
+// when arn is absent — e.g. a federated/anonymous principal) must kick in.
+func TestAWSAssumeRoleSameAccountRoleAssignment(t *testing.T) {
+	raw := map[string]any{
+		"CloudTrailEvent": `{"recipientAccountId":"111111111111",
+			"sourceIPAddress":"10.0.0.9",
+			"userIdentity":{"type":"AWSAccount","principalId":"111111111111:federated-session"},
+			"requestParameters":{"roleArn":"arn:aws:iam::111111111111:role/internal",
+				"roleSessionName":"internal-session"}}`,
+	}
+	r := wantType(t, AWS("AssumeRole", raw), "role_assignment")
+	p := decode(t, r, raw)
+	if p["member"] != "arn:aws:iam::111111111111:role/internal" {
+		t.Errorf("member = %v", p["member"])
+	}
+	if p["caller"] != "111111111111:federated-session" {
+		t.Errorf("caller (principalId fallback) = %v", p["caller"])
+	}
+	if p["session_name"] != "internal-session" {
+		t.Errorf("session_name = %v", p["session_name"])
+	}
+	if p["source_ip"] != "10.0.0.9" {
+		t.Errorf("source_ip = %v", p["source_ip"])
+	}
+	if p["target"] != "arn:aws:iam::111111111111:role/internal" {
+		t.Errorf("target = %v", p["target"])
 	}
 }
 
@@ -309,5 +364,89 @@ func TestPayloadCarriesRaw(t *testing.T) {
 	p := decode(t, r, raw)
 	if _, ok := p["raw"]; !ok {
 		t.Fatalf("payload missing raw key: %+v", p)
+	}
+}
+
+// --- credential redaction (mallcoppro-132) ----------------------------------
+
+// PayloadJSON must scrub STS session tokens out of stored raw payloads: this
+// is the shape cmd/aws/s3trail.go passes as "raw" — the already-decoded inner
+// CloudTrail record (not wrapped in a CloudTrailEvent string), so
+// responseElements.credentials sits directly in the object tree.
+func TestPayloadRedactsAssumeRoleCredentials(t *testing.T) {
+	rec := map[string]any{
+		"eventName": "AssumeRole",
+		"responseElements": map[string]any{
+			"credentials": map[string]any{
+				"accessKeyId":  "ASIAEXAMPLE",
+				"sessionToken": "FQoGZXIvYXdzEXAMPLETOKEN",
+				"expiration":   "Jul 17, 2026 1:00:00 PM",
+			},
+		},
+	}
+	r := Result{Type: "role_assignment", Payload: map[string]any{"action": "AssumeRole"}}
+	p := decode(t, r, rec)
+
+	rawOut, ok := p["raw"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw not a map: %T", p["raw"])
+	}
+	creds := dig(rawOut, "responseElements", "credentials")
+	if creds == nil {
+		t.Fatalf("responseElements.credentials missing from redacted raw: %+v", rawOut)
+	}
+	if creds["sessionToken"] != redactedValue {
+		t.Errorf("sessionToken = %v, want %q", creds["sessionToken"], redactedValue)
+	}
+	if creds["accessKeyId"] != "ASIAEXAMPLE" {
+		t.Errorf("accessKeyId = %v, want preserved", creds["accessKeyId"])
+	}
+	if creds["expiration"] != "Jul 17, 2026 1:00:00 PM" {
+		t.Errorf("expiration = %v, want preserved", creds["expiration"])
+	}
+}
+
+// Depth coverage + case-insensitivity + a different key (secretAccessKey), in
+// a shape resembling a non-AWS connector record (array of nested events, as
+// e.g. M365/Okta batches decode to) — proves the redaction walk is generic,
+// not AWS-specific, and isn't fooled by key casing.
+func TestPayloadRedactsCredentialsAtAnyDepth(t *testing.T) {
+	raw := map[string]any{
+		"batch": []any{
+			map[string]any{
+				"id": "evt-1",
+				"nested": map[string]any{
+					"deeper": map[string]any{
+						"SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+						"SessionToken":    "AQoEXAMPLEH4aoAH0gNCAPy...",
+						"accessKeyId":     "AKIAIOSFODNN7EXAMPLE",
+					},
+				},
+			},
+		},
+	}
+	r := Result{Type: "cloud_other", Payload: map[string]any{"action": "x"}}
+	p := decode(t, r, raw)
+
+	rawOut, ok := p["raw"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw not a map: %T", p["raw"])
+	}
+	batch, ok := rawOut["batch"].([]any)
+	if !ok || len(batch) != 1 {
+		t.Fatalf("batch = %+v", rawOut["batch"])
+	}
+	deeper := dig(batch[0].(map[string]any), "nested", "deeper")
+	if deeper == nil {
+		t.Fatalf("nested.deeper missing: %+v", batch[0])
+	}
+	if deeper["SecretAccessKey"] != redactedValue {
+		t.Errorf("SecretAccessKey = %v, want %q", deeper["SecretAccessKey"], redactedValue)
+	}
+	if deeper["SessionToken"] != redactedValue {
+		t.Errorf("SessionToken = %v, want %q", deeper["SessionToken"], redactedValue)
+	}
+	if deeper["accessKeyId"] != "AKIAIOSFODNN7EXAMPLE" {
+		t.Errorf("accessKeyId = %v, want preserved", deeper["accessKeyId"])
 	}
 }
