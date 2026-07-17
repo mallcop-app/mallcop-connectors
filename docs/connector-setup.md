@@ -7,7 +7,7 @@ same env vars work anywhere `mallcop scan` runs.
 
 - [How connectors work](#how-connectors-work)
 - [Prerequisite: install the sibling binaries](#prerequisite-install-the-sibling-binaries-kindcloud-only)
-- [GitHub](#github) · [Azure](#azure) · [AWS](#aws) · [Microsoft 365](#microsoft-365) · [GCP](#gcp) · [Okta](#okta)
+- [GitHub](#github) · [Azure](#azure) · [AWS](#aws) · [GuardDuty](#guardduty) · [Microsoft 365](#microsoft-365) · [GCP](#gcp) · [Okta](#okta)
 - [Cost & tuning](#cost--tuning) · [Verifying a connector](#verifying-a-connector)
 
 ---
@@ -20,7 +20,7 @@ A scan's sources are the `connectors:` list in `mallcop.yaml`. Three kinds:
 |--------|------|--------------------------|
 | `file` | reads a local events JSONL | no (built in) |
 | `github` | in-process GitHub org connector | no (built into the mallcop binary) |
-| `cloud` | forks a sibling binary `mallcop-connector-<source>` | **yes** — from this repo (`aws`, `azure`, `gcp`, `m365`, `okta`) |
+| `cloud` | forks a sibling binary `mallcop-connector-<source>` | **yes** — from this repo (`aws`, `azure`, `gcp`, `guardduty`, `m365`, `okta`) |
 
 Key behaviours to design around:
 
@@ -219,6 +219,57 @@ of a read-only IAM user), but OIDC avoids long-lived secrets.
 **Verify:** OIDC roles can only be assumed from an Actions run in the trusted repo, so
 verify with a branch `workflow_dispatch` rather than locally. The connector calls
 `CloudTrail:LookupEvents`.
+
+---
+
+## GuardDuty
+
+**Monitors:** AWS **GuardDuty findings** (`ListDetectors` -> `ListFindings` -> `GetFindings`)
+for the account/region. `kind: cloud, source: guardduty`. Unlike the `aws` (CloudTrail)
+connector, which reads a raw audit log mallcop's detectors then evaluate, GuardDuty
+findings are **already pre-triaged alerts** — the connector passes them through as
+`guardduty_finding` events with `"signal_class":"alert"`, not re-classified onto
+mallcop's admin-action gate vocabulary.
+
+> **GuardDuty must be enabled first — this has cost implications.** Unlike CloudTrail
+> (usually on by default) and unlike every other connector in this repo, GuardDuty is
+> an **opt-in, billed** AWS service: a 30-day free trial, then usage-based pricing per
+> account/region. Wiring this connector before enabling GuardDuty is safe (`ListDetectors`
+> returns empty, the connector logs a warning and exits 0 — see
+> [cmd/guardduty/README.md](../cmd/guardduty/README.md)) but produces zero findings.
+> **Enabling GuardDuty is a deliberate decision with a cost owner, not something this
+> connector or its setup does for you.**
+
+**Credentials — reuses the same GitHub OIDC assume-role as the `aws` connector above**
+(no separate role needed; add the GuardDuty read actions to the existing role's policy):
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["guardduty:ListDetectors", "guardduty:ListFindings", "guardduty:GetFindings"],
+  "Resource": "*"
+}
+```
+
+(The AWS-managed `AmazonGuardDutyReadOnlyAccess` policy covers this and more, if you'd
+rather attach a managed policy than hand-write the statement above.)
+
+**`mallcop.yaml`** — same OIDC-sourced env as `aws`; no `args` needed:
+```yaml
+  - kind: cloud
+    id: guardduty-myaccount
+    source: guardduty
+    binary: connectors/bin/guardduty
+    since: 3h
+    env: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION, AWS_DEFAULT_REGION]
+```
+
+**Verify (zero cost, works even before GuardDuty is enabled):** with the same
+assumed-role credentials the `aws` connector's OIDC step exports, `aws guardduty
+list-detectors --region <region>` → `200` with either a populated or empty
+`detectorIds` list. An empty list means GuardDuty isn't enabled yet — wiring the
+connector is still safe (see the callout above), you just won't see findings until
+someone enables it.
 
 ---
 

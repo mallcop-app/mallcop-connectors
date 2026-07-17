@@ -14,6 +14,7 @@ already on your `$PATH`.
 | `mallcop-connector-azure` | `azure` | Azure Activity Log | Service principal (OAuth2) | stable |
 | `mallcop-connector-gcp` | `gcp` | GCP Cloud Logging | Service account JSON | stable |
 | `mallcop-connector-github` | `github` | GitHub Audit Log | GitHub App installation | stable |
+| `mallcop-connector-guardduty` | `guardduty` | AWS GuardDuty findings | aws-sdk-go-v2 (env/profile) | stable |
 | `mallcop-connector-m365` | `m365` | Office 365 Management Activity API | App registration | stable |
 | `mallcop-connector-okta` | `okta` | Okta System Log | SSWS token | stable |
 
@@ -110,6 +111,15 @@ mallcop-connector-github \
   --since 2024-01-01T00:00:00Z
 ```
 
+### guardduty
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-east-1          # or --region flag
+mallcop-connector-guardduty --region us-east-1 --since 2024-01-01T00:00:00Z
+```
+
 ### m365
 
 ```bash
@@ -154,7 +164,7 @@ mallcop-connector-aws --region us-east-1 --cursor "$(cat cursor.txt)"
 
 The Go connectors aim for behavioral parity with the Python connectors of the same name. Two changes worth noting:
 
-- **Okta and GCP are new in Go** — no Python counterpart.
+- **Okta, GCP, and GuardDuty are new in Go** — no Python counterpart.
 - **Not yet ported from Python**: `container_logs`, `supabase`, `vercel`, `openclaw_config_drift`. If you depend on these, stay on Python mallcop 0.5.x or contribute a Go port upstream.
 
 ## Contributing
