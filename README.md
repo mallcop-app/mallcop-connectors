@@ -12,6 +12,7 @@ already on your `$PATH`.
 |---|---|---|---|---|
 | `mallcop-connector-aws` | `aws` | AWS CloudTrail | aws-sdk-go-v2 (env/profile) | stable |
 | `mallcop-connector-azure` | `azure` | Azure Activity Log | Service principal (OAuth2) | stable |
+| `mallcop-connector-cloudwatch` | `cloudwatch` | AWS CloudWatch alarm state transitions (alert stream) | aws-sdk-go-v2 (env/profile) | stable |
 | `mallcop-connector-gcp` | `gcp` | GCP Cloud Logging | Service account JSON | stable |
 | `mallcop-connector-github` | `github` | GitHub Audit Log | GitHub App installation | stable |
 | `mallcop-connector-m365` | `m365` | Office 365 Management Activity API | App registration | stable |
