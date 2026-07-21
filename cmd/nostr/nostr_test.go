@@ -268,6 +268,42 @@ func TestNormalizeNostrEventActorIsAuthorPubkey(t *testing.T) {
 	}
 }
 
+// TestNormalizeNostrEventFutureDatedIsUnreliable is the regression guard for
+// mallcoppro-174a: an author-chosen created_at far in the future must NOT be
+// trusted to advance the resume high-water mark (which would blackout
+// monitoring), yet the event must still be emitted (with ts≈now) so it is
+// monitored. A near-now created_at within the skew window stays reliable.
+func TestNormalizeNostrEventFutureDatedIsUnreliable(t *testing.T) {
+	farFuture := time.Now().Add(72 * time.Hour).Unix() // well beyond maxCreatedAtSkew
+	typed := nostrEvent{ID: "e-fut", PubKey: "attacker", Kind: 1, CreatedAt: farFuture}
+	raw := map[string]any{"id": "e-fut", "pubkey": "attacker", "kind": float64(1)}
+	evs, tsReliable, err := normalizeNostrEvent(raw, typed, "wss://relay.moot.pub")
+	if err != nil {
+		t.Fatalf("normalizeNostrEvent: %v", err)
+	}
+	if tsReliable {
+		t.Error("tsReliable = true for a far-future created_at; the cursor would be poisoned (mallcoppro-174a)")
+	}
+	if len(evs) != 1 {
+		t.Fatalf("want the event still emitted (monitored), got %d events", len(evs))
+	}
+	if evs[0].Timestamp.After(time.Now().Add(maxCreatedAtSkew)) {
+		t.Errorf("emitted Timestamp %v is implausibly future; should fall back to ~now", evs[0].Timestamp)
+	}
+
+	// A created_at just inside the skew window is still trusted.
+	nearNow := time.Now().Add(-time.Minute).Unix()
+	typed2 := nostrEvent{ID: "e-now", PubKey: "author", Kind: 1, CreatedAt: nearNow}
+	raw2 := map[string]any{"id": "e-now", "pubkey": "author", "kind": float64(1)}
+	_, tsReliable2, err := normalizeNostrEvent(raw2, typed2, "wss://relay.moot.pub")
+	if err != nil {
+		t.Fatalf("normalizeNostrEvent (near-now): %v", err)
+	}
+	if !tsReliable2 {
+		t.Error("tsReliable = false for a near-now created_at; want true")
+	}
+}
+
 func TestNormalizeNostrEventDeletionMapsToDeleteGate(t *testing.T) {
 	typed := nostrEvent{ID: "e2", PubKey: "author-2", Kind: 5, CreatedAt: 1700000001}
 	raw := map[string]any{

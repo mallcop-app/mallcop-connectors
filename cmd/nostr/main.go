@@ -66,6 +66,17 @@ const (
 	// relayTimeout bounds how long a single relay (dial + drain) may take,
 	// so one unresponsive relay cannot hang the whole one-shot run.
 	relayTimeout = 20 * time.Second
+
+	// maxCreatedAtSkew bounds how far into the future an event's
+	// author-chosen created_at may be and still be trusted to advance the
+	// resume high-water mark. nostr created_at is attacker-controlled: without
+	// an upper bound, a single event dated far in the future would push the
+	// emitted cursor past wall-clock, and every later run would resume from
+	// that future timestamp and skip all real events until the clock caught up
+	// — a durable monitoring blackout from one low-effort event (mallcoppro-174a).
+	// One hour tolerates legitimate clock drift between the author and us while
+	// rejecting implausible timestamps.
+	maxCreatedAtSkew = time.Hour
 )
 
 // maxMessageSize bounds a single relay websocket frame. Legitimate nostr
@@ -222,10 +233,14 @@ func decodeEventFrame(rest []json.RawMessage) (raw map[string]any, typed nostrEv
 // Azure subscription or AWS account.
 //
 // tsReliable mirrors cmd/azure's normalizeEntry contract: true only when
-// CreatedAt is a plausible, positive unix timestamp. A missing/zero
-// created_at must never be allowed to advance the resume high-water mark —
-// that would silently poison the cursor and skip real events on the next
-// run (see cmd/azure's identical guard and mallcoppro-a1e in project memory).
+// CreatedAt is a plausible unix timestamp — strictly positive AND not more
+// than maxCreatedAtSkew into the future. A missing/zero OR implausibly
+// future-dated created_at must never be allowed to advance the resume
+// high-water mark — either would silently poison the cursor and skip real
+// events on the next run (see cmd/azure's identical guard, mallcoppro-a1e in
+// project memory, and the future-date vector mallcoppro-174a). An unreliable
+// timestamp still emits the event (with ts=now) so it is monitored; it simply
+// does not move the cursor.
 func normalizeNostrEvent(raw map[string]any, typed nostrEvent, relayURL string) ([]*event.Event, bool, error) {
 	if typed.ID == "" {
 		return nil, false, errors.New("event missing id")
@@ -234,8 +249,9 @@ func normalizeNostrEvent(raw map[string]any, typed nostrEvent, relayURL string) 
 		return nil, false, errors.New("event missing pubkey")
 	}
 
-	tsReliable := typed.CreatedAt > 0
-	ts := time.Now().UTC()
+	now := time.Now().UTC()
+	tsReliable := typed.CreatedAt > 0 && typed.CreatedAt <= now.Add(maxCreatedAtSkew).Unix()
+	ts := now
 	if tsReliable {
 		ts = time.Unix(typed.CreatedAt, 0).UTC()
 	}
