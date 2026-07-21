@@ -15,7 +15,7 @@ BINDIR  ?= $(PREFIX)/bin
 DISTDIR ?= dist
 PREFIXED = mallcop-connector-
 
-SOURCES = aws azure cloudwatch coinbase gcp github guardduty m365 mercury okta
+SOURCES = aws azure cloudwatch coinbase gcp github guardduty loganalytics m365 mercury nostr okta
 BINARIES = $(addprefix $(DISTDIR)/$(PREFIXED),$(SOURCES))
 
 .PHONY: all build install uninstall clean test list
