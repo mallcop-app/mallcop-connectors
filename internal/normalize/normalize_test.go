@@ -203,6 +203,178 @@ func TestAzureUserAddNewActor(t *testing.T) {
 	}
 }
 
+// --- Azure relay-infra (Microsoft.App / Microsoft.DocumentDB /
+// Microsoft.ContainerRegistry / Microsoft.Network dnszones) -----------------
+//
+// The Type strings asserted below are byte-equal to real gate literals read
+// directly out of ~/projects/mallcop/core/detect (NOT reinvented here):
+//   - "config_change"    -- config_drift.go configRules (evType: "config_change")
+//   - "secret_access"    -- unusual_resource_access.go resourceAccessEventTypes,
+//                           AND scanned regardless-of-type by secrets_exposure.go
+//                           (the "scan-all" detector vocab.go documents)
+//   - "iam_policy_attach" -- config_drift.go configRules (evType: "iam_policy_attach")
+//   - "role_assignment"   -- priv_escalation.go builtinElevationEventTypes
+//   - "dependency_add"    -- dependency_tamper.go depTamperEventTypes
+// A mistyped Type here would compile and pass Go's type system fine but the
+// detector would silently never fire in production -- that's the whole bug
+// class this table exists to prevent, hence exact literal assertions.
+
+func TestAzureContainerAppWriteConfigDrift(t *testing.T) {
+	// Real op name + shape captured live via az rest against the Activity Log
+	// API for nostr-relay-prod (2026-07-20): a containerApps/write PATCH that
+	// attempted (and in that instance failed) a custom-hostname bind. Azure
+	// represents hostname binds as an ordinary containerApps/write -- there is
+	// no separate "hostname op"; the write body carries the customDomains
+	// change. So a single containerApps/write mapping covers both plain config
+	// changes AND hostname bind attempts.
+	entry := map[string]any{
+		"caller":     "opscb@3dl.dev",
+		"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/nostr-relay-prod",
+		"properties": map[string]any{
+			"statusCode":    "BadRequest",
+			"statusMessage": `{"error":{"code":"InvalidCustomHostNameValidation","message":"TXT record not found"}}`,
+		},
+	}
+	r := wantType(t, Azure("Microsoft.App/containerApps/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureManagedEnvironmentWriteConfigDrift(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/managedEnvironments/cae-nostr-relay-prod"}
+	r := wantType(t, Azure("Microsoft.App/managedEnvironments/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureContainerAppListSecretsSecretAccess(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/nostr-relay-prod"}
+	r := wantType(t, Azure("Microsoft.App/containerApps/listSecrets/action", entry), "secret_access")
+	p := decode(t, r, entry)
+	if p["target"] != entry["resourceId"] {
+		t.Errorf("target = %v", p["target"])
+	}
+}
+
+func TestAzureCosmosDatabaseAccountWriteConfigDrift(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod"}
+	r := wantType(t, Azure("Microsoft.DocumentDB/databaseAccounts/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureCosmosSqlRoleAssignmentFanOut(t *testing.T) {
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod/sqlRoleAssignments/ra1",
+		"properties": map[string]any{
+			"roleDefinitionId": "00000000-0000-0000-0000-000000000002", // Cosmos DB built-in Data Contributor
+			"principalId":      "victim-principal",
+		},
+	}
+	got := Azure("Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write", entry)
+	cd := wantType(t, got, "iam_policy_attach")
+	cdp := decode(t, cd, entry)
+	if cdp["resource_name"] != entry["resourceId"] {
+		t.Errorf("iam_policy_attach resource_name = %v", cdp["resource_name"])
+	}
+	pe := wantType(t, got, "role_assignment")
+	pep := decode(t, pe, entry)
+	if pep["target_user"] != "victim-principal" || pep["principal_id"] != "victim-principal" {
+		t.Errorf("role_assignment payload = %+v", pep)
+	}
+}
+
+func TestAzureCosmosListKeysSecretAccess(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod"}
+	r := wantType(t, Azure("Microsoft.DocumentDB/databaseAccounts/listKeys/action", entry), "secret_access")
+	p := decode(t, r, entry)
+	if p["target"] != entry["resourceId"] {
+		t.Errorf("target = %v", p["target"])
+	}
+}
+
+func TestAzureCosmosReadonlyKeysSecretAccess(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod"}
+	r := wantType(t, Azure("Microsoft.DocumentDB/databaseAccounts/readonlykeys/action", entry), "secret_access")
+	p := decode(t, r, entry)
+	if p["target"] != entry["resourceId"] {
+		t.Errorf("target = %v", p["target"])
+	}
+}
+
+func TestAzureContainerRegistryPushDependencyTamper(t *testing.T) {
+	entry := map[string]any{
+		"caller":     "ci@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.ContainerRegistry/registries/acrnostrrelayprod",
+		"properties": map[string]any{
+			"repository": "nostr-relay",
+			"tag":        "v0.19.0",
+		},
+	}
+	r := wantType(t, Azure("Microsoft.ContainerRegistry/registries/push/write", entry), "dependency_add")
+	p := decode(t, r, entry)
+	if p["package"] != "nostr-relay" || p["ecosystem"] != "docker" || p["direct"] != true {
+		t.Errorf("payload = %+v", p)
+	}
+}
+
+func TestAzureDNSRecordWriteConfigDrift(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/moot-rg/providers/Microsoft.Network/dnszones/moot.pub/A/asuid.relay"}
+	r := wantType(t, Azure("Microsoft.Network/dnsZones/A/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureDNSRecordDeleteConfigDrift(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg-dns/providers/Microsoft.Network/dnszones/3dl.network/CNAME/relay"}
+	r := wantType(t, Azure("Microsoft.Network/dnsZones/CNAME/delete", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+// TestAzureDNSRecordCaseInsensitive pins a real production finding: the SAME
+// logical Azure operation was observed in the live subscription's Activity Log
+// with TWO different casings of the resource-provider segment --
+// "Microsoft.Network/dnsZones/..." and "Microsoft.Network/dnszones/..." --
+// across different events (az monitor activity-log list against moot-rg /
+// rg-dns, 2026-07-20). A case-sensitive switch would silently drop half the
+// real-world record-write events into CatchAll, so the match must be
+// case-insensitive.
+func TestAzureDNSRecordCaseInsensitive(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/moot-rg/providers/Microsoft.Network/dnszones/moot.pub/TXT/asuid.relay"}
+	r := wantType(t, Azure("microsoft.network/dnszones/txt/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+// TestAzureDNSZoneLevelWriteUnmapped is a negative test: zone-LEVEL writes
+// (creating/deleting the whole dnszone resource, no record-type segment) are
+// out of scope per the item spec ("record write/delete") -- only per-record
+// operations map to config-drift. This also guards against a loose
+// prefix/suffix matcher accidentally slurping in
+// dnssecConfigs/write or diagnosticSettings/write, which also end in
+// "/write" under the same Microsoft.Network/dnszones/ prefix.
+func TestAzureDNSZoneLevelWriteUnmapped(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/moot-rg/providers/Microsoft.Network/dnszones/moot.pub"}
+	r := wantType(t, Azure("Microsoft.Network/dnsZones/write", entry), CatchAll)
+	if r.Type != CatchAll {
+		t.Errorf("zone-level write should stay CatchAll, got %q", r.Type)
+	}
+}
+
 // --- GCP -------------------------------------------------------------------
 
 func TestGCPSetIamPolicyFanOut(t *testing.T) {
