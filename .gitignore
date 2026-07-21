@@ -28,6 +28,7 @@ vendor/
 /gcp
 /m365
 /okta
+/nostr
 # Namespaced connector binaries if built into the repo root
 /mallcop-connector-*
 
