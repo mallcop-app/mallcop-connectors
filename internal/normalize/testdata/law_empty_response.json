@@ -1,0 +1,1 @@
+{"tables":[{"name":"PrimaryResult","columns":[{"name":"TimeGenerated","type":"datetime"},{"name":"Log_s","type":"string"}],"rows":[]}]}
