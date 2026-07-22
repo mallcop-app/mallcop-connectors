@@ -1,0 +1,31 @@
+{
+  "tables": [
+    {
+      "name": "PrimaryResult",
+      "columns": [
+        { "name": "TimeGenerated", "type": "datetime" },
+        { "name": "OperationName", "type": "string" },
+        { "name": "Repository", "type": "string" },
+        { "name": "Tag", "type": "string" },
+        { "name": "Digest", "type": "string" },
+        { "name": "Identity", "type": "string" },
+        { "name": "CallerIpAddress", "type": "string" },
+        { "name": "LoginServer", "type": "string" },
+        { "name": "ResultType", "type": "string" }
+      ],
+      "rows": [
+        [
+          "2026-07-20T15:08:57.6958849Z",
+          "Push",
+          "nostr-relay-prod",
+          "mallcoppro-813",
+          "sha256:a598cf1f801a80d5d822772d4da4de4759069cc48a60c102231bc5aadaca20b4",
+          "mallcop-deploy-github-actions-sp",
+          "20.42.10.7",
+          "acrnostrrelayprod.azurecr.io",
+          "Success"
+        ]
+      ]
+    }
+  ]
+}
