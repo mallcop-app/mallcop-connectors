@@ -162,15 +162,22 @@ func Azure(opName string, entry map[string]any) []Result {
 	case strings.EqualFold(opName, "Microsoft.Insights/diagnosticSettings/write"):
 		p := map[string]any{"config_key": "diagnosticSettings"}
 		set(p, "resource_name", resourceID)
-		typ := "audit_log_disabled"
-		desc := "diagnostic setting written; LAW-pipeline removal could not be verified from this Activity Log entry -- defaulting to audit-blinding alert"
-		if rb := azureRequestBodyProps(props); rb != nil {
-			if removesLAWPipeline(rb) {
-				desc = "audit log diagnostic setting modified: LAW pipeline removed"
-			} else {
-				typ = "config_change"
-				desc = "diagnostic setting updated; LAW pipeline still present"
-			}
+		// Only escalate to the audit-blinding alert (audit_log_disabled ->
+		// config-drift CRITICAL) when the write's requestbody CONFIRMS the LAW
+		// pipeline was removed or fully disabled. When the pipeline is intact,
+		// or the state can't be read (the common Succeeded/EndRequest event
+		// carries no requestbody), fall back to config_change (config-drift
+		// MEDIUM) rather than crying wolf. mallcoppro-2627: the old default
+		// fired CRITICAL on EVERY diagnosticSettings write -- including benign
+		// monitoring ADDITIONS -- which is alarm fatigue that trains operators
+		// to ignore the signal. Real removals are still caught two ways: the
+		// paired BeginRequest event carries the requestbody, and an outright
+		// deletion is the unambiguous diagnosticSettings/delete case below.
+		typ := "config_change"
+		desc := "diagnostic setting written; LAW pipeline intact or unverifiable from this Activity Log entry"
+		if rb := azureRequestBodyProps(props); rb != nil && removesLAWPipeline(rb) {
+			typ = "audit_log_disabled"
+			desc = "audit log diagnostic setting modified: LAW pipeline removed or all categories disabled"
 		}
 		set(p, "change_description", desc)
 		return []Result{{Type: typ, Payload: p}}
@@ -551,8 +558,31 @@ func azureRequestBodyProps(props map[string]any) map[string]any {
 // are provisioned in this subscription -- confirmed via `az monitor
 // diagnostic-settings list`, empty result). See the c789 progress note for
 // the follow-up to verify once a real diagnosticSettings resource exists.
+// removesLAWPipeline reports whether a diagnostic-setting write leaves the audit
+// pipeline blinded — i.e. it no longer routes to a Log Analytics Workspace, OR
+// it names a workspace but every log category is disabled (routing nowhere
+// useful). mallcoppro-2627: the old check only tested workspaceId=="" and so
+// treated any non-empty workspaceId as "intact", missing the all-categories-
+// disabled evasion and forcing the write case to over-default to CRITICAL.
 func removesLAWPipeline(rb map[string]any) bool {
-	return mapStr(rb, "workspaceId") == ""
+	if mapStr(rb, "workspaceId") == "" {
+		return true
+	}
+	logs, ok := rb["logs"].([]any)
+	if !ok || len(logs) == 0 {
+		// Workspace present, no readable log-category config — assume intact.
+		return false
+	}
+	for _, l := range logs {
+		lm, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+		if enabled, ok := lm["enabled"].(bool); ok && enabled {
+			return false // at least one category still flowing to the LAW
+		}
+	}
+	return true // workspace named but every category disabled — blinded
 }
 
 // lastSegment returns the final path segment of a slash-delimited string.

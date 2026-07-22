@@ -588,18 +588,34 @@ func TestAzureDiagnosticSettingWriteKeepsLAWConfigChange(t *testing.T) {
 	}
 }
 
-// TestAzureDiagnosticSettingWriteUnreadableDefaultsAuditDisabled matches the
-// REAL EndRequest shape (no requestbody at all -- see the package doc block
-// above): when the LAW-removal toggle can't be verified, default to the
-// audit-blinding alert rather than silently downgrading, since a missed
-// audit-disable is worse than a false-positive review.
-func TestAzureDiagnosticSettingWriteUnreadableDefaultsAuditDisabled(t *testing.T) {
+// TestAzureDiagnosticSettingWriteUnreadableDefaultsConfigChange matches the REAL
+// EndRequest shape (no requestbody at all). mallcoppro-2627: when the LAW-removal
+// toggle can't be verified, fall back to config_change (config-drift MEDIUM), NOT
+// the audit-blinding CRITICAL. Live proof showed the old default fired CRITICAL on
+// every benign diagnostic write (a real acr-diag-to-law ADDITION), which is alarm
+// fatigue. Real removals are still caught via the requestbody-bearing BeginRequest
+// event and the unambiguous diagnosticSettings/delete case.
+func TestAzureDiagnosticSettingWriteUnreadableDefaultsConfigChange(t *testing.T) {
 	entry := map[string]any{"resourceId": "/diag/setting1"}
-	r := wantType(t, Azure("microsoft.insights/diagnosticSettings/write", entry), "audit_log_disabled")
+	r := wantType(t, Azure("microsoft.insights/diagnosticSettings/write", entry), "config_change")
 	p := decode(t, r, entry)
 	if p["resource_name"] != "/diag/setting1" {
 		t.Errorf("resource_name = %v", p["resource_name"])
 	}
+}
+
+// TestAzureDiagnosticSettingWriteAllCategoriesDisabledAuditDisabled covers the
+// mallcoppro-2627 hardening: a write that names a workspace but disables every
+// log category routes nothing to the LAW — an audit-blinding evasion the old
+// workspaceId-only check missed. Must escalate to audit_log_disabled.
+func TestAzureDiagnosticSettingWriteAllCategoriesDisabledAuditDisabled(t *testing.T) {
+	entry := map[string]any{
+		"resourceId": "/diag/setting1",
+		"properties": map[string]any{
+			"requestbody": `{"properties":{"workspaceId":"/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.OperationalInsights/workspaces/law-nostr-relay-prod","logs":[{"category":"ContainerAppConsoleLogs","enabled":false},{"category":"ContainerAppSystemLogs","enabled":false}]}}`,
+		},
+	}
+	wantType(t, Azure("Microsoft.Insights/diagnosticSettings/write", entry), "audit_log_disabled")
 }
 
 // TestAzureDiagnosticSettingRealCasingWriteCaughtLive pins a live-proof-caught
@@ -608,13 +624,16 @@ func TestAzureDiagnosticSettingWriteUnreadableDefaultsAuditDisabled(t *testing.T
 // operationName.value "Microsoft.Insights/diagnosticSettings/write" (capital
 // M, capital I) -- the pre-existing exact-lowercase match
 // ("microsoft.insights/diagnosticSettings/write") never matched this and
-// silently fell through to CatchAll in production, meaning the
-// audit-blinding detector NEVER fired for a real diagnostic-settings write.
+// silently fell through to CatchAll in production. This test proves the CASING
+// match works — the event is mapped, not dropped to CatchAll. Post-mallcoppro-2627
+// a no-requestbody write maps to config_change (config-drift MEDIUM), not the
+// CRITICAL audit-blinding alert; the point here is that the real PascalCase
+// operationName is CAUGHT at all.
 // Same casing-inconsistency class already proven for Microsoft.Network/
 // dnszones (mallcoppro-d63).
 func TestAzureDiagnosticSettingRealCasingWriteCaughtLive(t *testing.T) {
 	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/nostr-relay-prod/providers/Microsoft.Insights/diagnosticSettings/relay-diag"}
-	r := wantType(t, Azure("Microsoft.Insights/diagnosticSettings/write", entry), "audit_log_disabled")
+	r := wantType(t, Azure("Microsoft.Insights/diagnosticSettings/write", entry), "config_change")
 	p := decode(t, r, entry)
 	if p["resource_name"] != entry["resourceId"] {
 		t.Errorf("resource_name = %v", p["resource_name"])
