@@ -1,6 +1,9 @@
 package normalize
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // Azure maps a raw Azure Activity Log entry to canonical mallcop events.
 //
@@ -16,6 +19,10 @@ func Azure(opName string, entry map[string]any) []Result {
 	case opName == "Microsoft.Authorization/roleAssignments/write":
 		role := firstNonEmpty(mapStr(props, "roleDefinitionName"), mapStr(props, "roleDefinitionId"))
 		principal := mapStr(props, "principalId")
+		if rb := azureRequestBodyProps(props); rb != nil {
+			role = firstNonEmpty(role, mapStr(rb, "roleDefinitionName"), mapStr(rb, "roleDefinitionId"))
+			principal = firstNonEmpty(principal, mapStr(rb, "principalId"))
+		}
 		p := map[string]any{"action": "role_assignment"}
 		set(p, "role", role)
 		set(p, "role_name", role)
@@ -24,16 +31,31 @@ func Azure(opName string, entry map[string]any) []Result {
 		set(p, "resource_name", resourceID)
 		return []Result{{Type: "role_assignment", Payload: p}}
 
+	// roleAssignments/delete is the authorization-subversion mirror of write:
+	// removing another principal's role assignment is just as much a control-
+	// plane authorization change as granting one (denial-of-service against a
+	// legitimate admin, or an attacker covering tracks by deleting a
+	// competing grant). Mapped to the SAME "role_assignment" gate as write
+	// (mallcoppro-c789 spec) rather than the pre-existing "iam_change", which
+	// was a stale generic catch-all predating this item's authorization-
+	// subversion scope. action is "remove_role_assignment" (not the raw
+	// Azure "delete") so priv-escalation's isElevated() narrowing guard
+	// (action-prefix "remove"/"revoke"/"delete_role" = benign narrowing, not
+	// escalation) applies correctly instead of silently bypassing it.
 	case opName == "Microsoft.Authorization/roleAssignments/delete":
-		role := mapStr(props, "roleDefinitionName")
+		role := firstNonEmpty(mapStr(props, "roleDefinitionName"), mapStr(props, "roleDefinitionId"))
 		principal := mapStr(props, "principalId")
-		p := map[string]any{"action": "delete"}
+		if rb := azureRequestBodyProps(props); rb != nil {
+			role = firstNonEmpty(role, mapStr(rb, "roleDefinitionName"), mapStr(rb, "roleDefinitionId"))
+			principal = firstNonEmpty(principal, mapStr(rb, "principalId"))
+		}
+		p := map[string]any{"action": "remove_role_assignment"}
 		set(p, "role", role)
 		set(p, "role_name", role)
 		set(p, "target_user", principal)
 		set(p, "principal_id", principal)
 		set(p, "resource_name", resourceID)
-		return []Result{{Type: "iam_change", Payload: p}}
+		return []Result{{Type: "role_assignment", Payload: p}}
 
 	case opName == "Microsoft.Authorization/roleDefinitions/write":
 		p := map[string]any{}
@@ -62,6 +84,27 @@ func Azure(opName string, entry map[string]any) []Result {
 		set(p, "display_name", firstNonEmpty(mapStr(props, "displayName"), lastSegment(resourceID)))
 		set(p, "principal_id", mapStr(props, "principalId"))
 		return []Result{{Type: "service_principal_created", Payload: p}}
+
+	// federatedIdentityCredentials/write attaches an external OIDC
+	// issuer+subject trust to a managed identity -- the workload-identity-
+	// federation abuse pattern (an external principal, e.g. a GitHub Actions
+	// repo, becomes able to assume the identity with no secret exchange).
+	// Paired with userAssignedIdentities/write above per the mallcoppro-c789
+	// spec ("role_assignment or config_change"); config_change chosen since
+	// this is a trust-boundary/perimeter configuration change, consistent
+	// with how this file treats other boundary changes (DNS, ACR, Container
+	// Apps ingress). Case-insensitive match: this is the same
+	// Microsoft.ManagedIdentity provider family where `az provider operation
+	// show` returns operation names lowercased, and Microsoft.App/
+	// Microsoft.Network have both proven to emit inconsistent live casing
+	// for their newer resource types (mallcoppro-d63) -- not independently
+	// live-verified for this op (no federatedIdentityCredentials exist in
+	// this subscription), so matched defensively.
+	case strings.EqualFold(opName, "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/write"):
+		p := map[string]any{}
+		set(p, "resource_name", resourceID)
+		set(p, "change_description", "federated identity credential written: external OIDC trust attached to a managed identity")
+		return []Result{{Type: "config_change", Payload: p}}
 
 	case opName == "Microsoft.Directory/users/add" || opName == "Microsoft.AAD/users/write":
 		p := map[string]any{"action": "user_created"}
@@ -98,13 +141,42 @@ func Azure(opName string, entry map[string]any) []Result {
 		p["new_value"] = "rule added"
 		return []Result{{Type: "firewall_rule_add", Payload: p}}
 
-	case opName == "microsoft.insights/diagnosticSettings/write":
+	// AUDIT-BLINDING: a diagnosticSettings write can either ADD/strengthen a
+	// LAW-routed audit pipeline (benign) or REMOVE it (someone turning off the
+	// monitor itself, mallcoppro-c789). Distinguished by whether the write's
+	// resulting state still names a Log Analytics Workspace destination
+	// (properties.workspaceId, per the documented diagnostic-setting resource
+	// schema). When the toggle can't be read at all (no requestbody), default
+	// to the audit-blinding alert: a missed audit-disable is worse than a
+	// false-positive review of a benign logging addition.
+	//
+	// CASE-INSENSITIVE — LIVE-PROOF-CAUGHT BUG (mallcoppro-c789, 2026-07-21):
+	// the pre-existing match here was the exact-lowercase string
+	// "microsoft.insights/diagnosticSettings/write". A real captured event
+	// from nostr-relay-prod's Activity Log (az monitor activity-log list -g
+	// nostr-relay-prod --offset 7d) has operationName.value
+	// "Microsoft.Insights/diagnosticSettings/write" -- capital M, capital I --
+	// which NEVER matched, silently falling through to CatchAll in
+	// production. This is the SAME casing-inconsistency class already proven
+	// for Microsoft.Network/dnszones (mallcoppro-d63); fixed the same way.
+	case strings.EqualFold(opName, "Microsoft.Insights/diagnosticSettings/write"):
 		p := map[string]any{"config_key": "diagnosticSettings"}
 		set(p, "resource_name", resourceID)
-		set(p, "change_description", "audit log diagnostic setting modified")
-		return []Result{{Type: "audit_log_disabled", Payload: p}}
+		typ := "audit_log_disabled"
+		desc := "diagnostic setting written; LAW-pipeline removal could not be verified from this Activity Log entry -- defaulting to audit-blinding alert"
+		if rb := azureRequestBodyProps(props); rb != nil {
+			if removesLAWPipeline(rb) {
+				desc = "audit log diagnostic setting modified: LAW pipeline removed"
+			} else {
+				typ = "config_change"
+				desc = "diagnostic setting updated; LAW pipeline still present"
+			}
+		}
+		set(p, "change_description", desc)
+		return []Result{{Type: typ, Payload: p}}
 
-	case opName == "microsoft.insights/diagnosticSettings/delete":
+	// Case-insensitive for the same live-proven reason as the write case above.
+	case strings.EqualFold(opName, "Microsoft.Insights/diagnosticSettings/delete"):
 		p := map[string]any{}
 		set(p, "resource_name", resourceID)
 		set(p, "change_description", "diagnostic setting deleted")
@@ -116,15 +188,21 @@ func Azure(opName string, entry map[string]any) []Result {
 		set(p, "change_description", "Defender config changed")
 		return []Result{{Type: "config_change", Payload: p}}
 
-	case opName == "Microsoft.KeyVault/vaults/secrets/read" ||
-		opName == "Microsoft.KeyVault/vaults/secrets/getSecret/action":
+	// Wildcarded across every Microsoft.KeyVault/vaults/secrets/* operation
+	// (read, write, delete, backup/purge/recover/restore/setSecret/
+	// getSecret/readMetadata/update actions — confirmed exhaustively via `az
+	// provider operation show --namespace Microsoft.KeyVault`), not just
+	// read/getSecret: a WRITE planting a new secret, or a DELETE/purge
+	// destroying one, is exactly as much "someone touched a secret" as a read
+	// for this authorization-subversion surface (mallcoppro-c789 spec).
+	case strings.HasPrefix(strings.ToLower(opName), "microsoft.keyvault/vaults/secrets/"):
 		p := map[string]any{"action": "secret_access"}
 		set(p, "target", resourceID)
 		set(p, "resource", resourceID)
 		set(p, "resource_id", resourceID)
 		return []Result{{Type: "secret_access", Payload: p}}
 
-	case opName == "Microsoft.KeyVault/vaults/write":
+	case strings.EqualFold(opName, "Microsoft.KeyVault/vaults/write"):
 		p := map[string]any{"config_key": "keyVaultAccessPolicies"}
 		set(p, "resource_name", resourceID)
 		set(p, "change_description", "Key Vault policy modified")
@@ -207,11 +285,44 @@ func Azure(opName string, entry map[string]any) []Result {
 		set(p, "resource_id", resourceID)
 		return []Result{{Type: "secret_access", Payload: p}}
 
+	// managedCertificates write/delete is the custom-domain TLS cert surface:
+	// an attacker who can mint/replace the managed cert for the relay's
+	// custom domain can intercept or re-point TLS traffic even without a DNS
+	// change. Case-insensitive (see isAzureManagedCertChange doc) — same
+	// casing hazard class already proven live for Microsoft.Network/dnszones
+	// (mallcoppro-d63), not independently live-verified for this op (no
+	// managedCertificates resources exist in this subscription).
+	case isAzureManagedCertChange(opName):
+		p := map[string]any{}
+		set(p, "resource_name", resourceID)
+		set(p, "change_description", "Container Apps managed certificate change: "+opName)
+		return []Result{{Type: "config_change", Payload: p}}
+
 	// --- relay-infra data plane (Microsoft.DocumentDB / Cosmos DB) ----------
+	//
+	// disableLocalAuth toggled OFF re-enables Cosmos master-key auth on an
+	// account meant to be AAD-only -- a classic authorization-perimeter
+	// downgrade. LIVE-VERIFIED (az rest against nostr-relay-prod's Activity
+	// Log, 2026-07-21): the Administrative "EndRequest" event Azure actually
+	// retains for this op carries NO request body at all (properties is just
+	// {entity, eventCategory, hierarchy, message}); only a paired
+	// "BeginRequest" event (not always captured/paginated the same way) would
+	// carry it, as a JSON-ENCODED STRING under properties.requestbody. Per
+	// the item spec's own escape hatch: when the toggle isn't reliably
+	// readable, stay on config_change and note the limitation rather than
+	// inventing a distinct gate for a field that's usually absent.
 	case opName == "Microsoft.DocumentDB/databaseAccounts/write":
 		p := map[string]any{}
 		set(p, "resource_name", resourceID)
-		set(p, "change_description", "Cosmos DB account configuration changed")
+		desc := "Cosmos DB account configuration changed (disableLocalAuth toggle not reliably readable from this Activity Log entry)"
+		if rb := azureRequestBodyProps(props); rb != nil {
+			if dla, ok := rb["disableLocalAuth"].(bool); ok && !dla {
+				desc = "Cosmos DB disableLocalAuth turned OFF -- AAD-only authorization weakened to allow key-based auth"
+			} else {
+				desc = "Cosmos DB account configuration changed"
+			}
+		}
+		set(p, "change_description", desc)
 		return []Result{{Type: "config_change", Payload: p}}
 
 	// sqlRoleAssignments/write grants a Cosmos DB SQL RBAC role to a
@@ -224,6 +335,10 @@ func Azure(opName string, entry map[string]any) []Result {
 	case opName == "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write":
 		principal := mapStr(props, "principalId")
 		role := firstNonEmpty(mapStr(props, "roleDefinitionName"), mapStr(props, "roleDefinitionId"))
+		if rb := azureRequestBodyProps(props); rb != nil {
+			role = firstNonEmpty(role, mapStr(rb, "roleDefinitionName"), mapStr(rb, "roleDefinitionId"))
+			principal = firstNonEmpty(principal, mapStr(rb, "principalId"))
+		}
 		cd := map[string]any{"action": "role_assignment"}
 		set(cd, "resource_name", resourceID)
 		set(cd, "policy_name", role)
@@ -239,14 +354,60 @@ func Azure(opName string, entry map[string]any) []Result {
 			{Type: "role_assignment", Payload: pe},
 		}
 
+	// sqlRoleAssignments/delete: same fan-out as write per the mallcoppro-c789
+	// spec. Unlike Authorization/roleAssignments/delete (which narrows
+	// access, hence action "remove_role_assignment" there), a Cosmos SQL role
+	// assignment delete still fans out to iam_policy_attach + role_assignment
+	// literally as specified -- deleting authorization state on the relay's
+	// data-plane database is itself worth a config-drift/priv-escalation
+	// signal (e.g. an attacker removing a legitimate operator's access, or
+	// erasing evidence of a role grant).
+	case opName == "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/delete":
+		principal := mapStr(props, "principalId")
+		role := firstNonEmpty(mapStr(props, "roleDefinitionName"), mapStr(props, "roleDefinitionId"))
+		if rb := azureRequestBodyProps(props); rb != nil {
+			role = firstNonEmpty(role, mapStr(rb, "roleDefinitionName"), mapStr(rb, "roleDefinitionId"))
+			principal = firstNonEmpty(principal, mapStr(rb, "principalId"))
+		}
+		cd := map[string]any{"action": "role_assignment"}
+		set(cd, "resource_name", resourceID)
+		set(cd, "policy_name", role)
+		set(cd, "change_description", "Cosmos DB SQL role assignment deleted")
+		pe := map[string]any{"action": "remove_role_assignment"}
+		set(pe, "role", role)
+		set(pe, "role_name", role)
+		set(pe, "target_user", principal)
+		set(pe, "principal_id", principal)
+		set(pe, "resource_name", resourceID)
+		return []Result{
+			{Type: "iam_policy_attach", Payload: cd},
+			{Type: "role_assignment", Payload: pe},
+		}
+
+	// listKeys/readonlykeys/regenerateKey are all Cosmos master-key retrieval
+	// or rotation actions -- the same secret_access surface. regenerateKey op
+	// name confirmed via `az provider operation show --namespace
+	// Microsoft.DocumentDB` (Microsoft.DocumentDB/databaseAccounts/regenerateKey/action).
 	case opName == "Microsoft.DocumentDB/databaseAccounts/listKeys/action" ||
-		opName == "Microsoft.DocumentDB/databaseAccounts/readonlykeys/action":
+		opName == "Microsoft.DocumentDB/databaseAccounts/readonlykeys/action" ||
+		opName == "Microsoft.DocumentDB/databaseAccounts/regenerateKey/action":
 		p := map[string]any{"action": "secret_access"}
 		set(p, "target", resourceID)
 		set(p, "resource_id", resourceID)
 		return []Result{{Type: "secret_access", Payload: p}}
 
 	// --- relay-infra supply chain (Microsoft.ContainerRegistry) -------------
+
+	// registries/write is the ACR resource's own config surface (admin user
+	// toggle, network rules, SKU, replication) — distinct from
+	// registries/push/write (an image push) below. Absorbs mallcoppro-386.
+	// Live-verified: `az monitor activity-log list -g nostr-relay-prod
+	// --offset 7d` shows real registries/write events on acrnostrrelayprod.
+	case opName == "Microsoft.ContainerRegistry/registries/write":
+		p := map[string]any{}
+		set(p, "resource_name", resourceID)
+		set(p, "change_description", "Container Registry configuration changed (admin user, network rules, SKU, or replication)")
+		return []Result{{Type: "config_change", Payload: p}}
 	//
 	// A registry push is a directly-authored artifact landing in the supply
 	// chain — the closest fit in dependency-tamper's fixed vocabulary is
@@ -307,6 +468,91 @@ func isAzureDNSRecordChange(opName string) bool {
 		}
 	}
 	return false
+}
+
+// azureManagedCertOps are the managedCertificates operation-name suffixes
+// (lowercase, per `az provider operation show --namespace Microsoft.App`
+// which returns this newer resource-type family lowercased) this connector
+// treats as a perimeter change.
+var azureManagedCertOps = []string{
+	"microsoft.app/managedenvironments/managedcertificates/write",
+	"microsoft.app/managedenvironments/managedcertificates/delete",
+}
+
+// isAzureManagedCertChange reports whether opName is a managed-certificate
+// write or delete under Microsoft.App/managedEnvironments/managedCertificates,
+// matched case-insensitively. Azure's Microsoft.App provider has already
+// proven (via Microsoft.Network/dnszones, mallcoppro-d63) to emit
+// inconsistent live casing for its resource-type segments; this op family
+// hasn't been independently live-verified (no managedCertificates resources
+// exist in this subscription yet), so it is matched defensively rather than
+// assuming the documented PascalCase form holds.
+func isAzureManagedCertChange(opName string) bool {
+	lower := strings.ToLower(opName)
+	for _, op := range azureManagedCertOps {
+		if lower == op {
+			return true
+		}
+	}
+	return false
+}
+
+// azureRequestBodyProps decodes properties.requestbody -- the JSON-ENCODED
+// STRING Azure Activity Log's "BeginRequest" events carry the write payload
+// under -- into its nested "properties" object, when present.
+//
+// LIVE-VERIFIED (az rest against nostr-relay-prod's real Activity Log,
+// 2026-07-21, covering roleAssignments/write, sqlRoleAssignments/write,
+// databaseAccounts/write, and ContainerRegistry registries/write): the
+// Administrative-category "EndRequest" event -- the one carrying the
+// terminal "Succeeded" status, i.e. the event most naturally associated with
+// "this action completed" -- exposes NO request detail whatsoever;
+// properties is just {entity, eventCategory, hierarchy, message,
+// statusCode}. Only the PAIRED "BeginRequest" event (same operationId,
+// earlier eventTimestamp, status "Started") carries the actual write body,
+// and only as this JSON-encoded string -- keyed by roleDefinitionId (a raw
+// GUID; roleDefinitionName never appears in ANY live-captured event) for
+// authorization writes. This mirrors awsInner()'s handling of AWS's
+// CloudTrailEvent string field (aws.go) -- same idiom, different provider.
+//
+// Both events flow through this connector independently (cmd/azure/main.go's
+// normalizeEntry has no eventName filter), so a caller that reads ONLY flat
+// properties fields will get an empty role/principal on BOTH resulting
+// mallcop events for a real production roleAssignments/write. Every case in
+// this file that needs role/principal detail tries flat properties FIRST,
+// then falls back to this function -- additive, so synthetic
+// flat-properties test fixtures (this package's existing convention) are
+// unaffected.
+//
+// Returns nil when requestbody is absent or unparseable, so callers can
+// treat that as "not reliably readable" -- the same class of gap the
+// mallcoppro-c789 spec explicitly calls out for Cosmos disableLocalAuth (see
+// the databaseAccounts/write case above) and extends to diagnosticSettings'
+// LAW-pipeline check.
+func azureRequestBodyProps(props map[string]any) map[string]any {
+	raw := mapStr(props, "requestbody")
+	if raw == "" {
+		return nil
+	}
+	var body struct {
+		Properties map[string]any `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		return nil
+	}
+	return body.Properties
+}
+
+// removesLAWPipeline reports whether a diagnostic-setting write body's
+// resulting state names NO Log Analytics Workspace destination
+// (properties.workspaceId empty/absent) -- i.e. the write leaves the audit
+// pipeline blind. Based on the documented Azure diagnostic-setting resource
+// schema; NOT independently live-verified (no diagnosticSettings resources
+// are provisioned in this subscription -- confirmed via `az monitor
+// diagnostic-settings list`, empty result). See the c789 progress note for
+// the follow-up to verify once a real diagnosticSettings resource exists.
+func removesLAWPipeline(rb map[string]any) bool {
+	return mapStr(rb, "workspaceId") == ""
 }
 
 // lastSegment returns the final path segment of a slash-delimited string.

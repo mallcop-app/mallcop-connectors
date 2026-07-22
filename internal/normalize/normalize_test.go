@@ -2,6 +2,7 @@ package normalize
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -372,6 +373,260 @@ func TestAzureDNSZoneLevelWriteUnmapped(t *testing.T) {
 	r := wantType(t, Azure("Microsoft.Network/dnsZones/write", entry), CatchAll)
 	if r.Type != CatchAll {
 		t.Errorf("zone-level write should stay CatchAll, got %q", r.Type)
+	}
+}
+
+// --- Azure authorization + perimeter subversion (mallcoppro-c789) -----------
+//
+// Type strings below are byte-equal to real gate literals (grep'd, not
+// reinvented) out of ~/projects/mallcop/core/detect:
+//   - "role_assignment"    -- priv_escalation.go builtinElevationEventTypes
+//   - "iam_policy_attach"  -- config_drift.go configRules
+//   - "config_change"      -- config_drift.go configRules
+//   - "secret_access"      -- unusual_resource_access.go resourceAccessEventTypes
+//   - "audit_log_disabled" -- config_drift.go configRules
+//
+// LIVE-VERIFIED FIELD SHAPE (az rest against nostr-relay-prod's Activity Log,
+// 2026-07-21): the Administrative-category "EndRequest" event (the terminal
+// Succeeded one) carries NO request detail -- properties is just {entity,
+// eventCategory, hierarchy, message}. Only the paired "BeginRequest" event
+// carries the actual write body, and only as a JSON-ENCODED STRING under
+// properties.requestbody, keyed by roleDefinitionId (a GUID -- roleDefinitionName
+// never appears). Fixtures below exercise BOTH shapes: the requestbody-bearing
+// one (real BeginRequest shape) AND the flat-properties one (matches this
+// package's existing test convention / a hypothetical richer API response) to
+// prove azureRequestBodyProps' fallback doesn't regress the flat path.
+
+func TestAzureRoleAssignmentDeleteRoleAssignment(t *testing.T) {
+	// Real BeginRequest shape: requestbody is a JSON string, roleDefinitionId
+	// (GUID) not roleDefinitionName.
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.ContainerRegistry/registries/acrnostrrelayprod/providers/Microsoft.Authorization/roleAssignments/c867cdf3",
+		"properties": map[string]any{
+			"requestbody": `{"properties":{"roleDefinitionId":"/subscriptions/s/providers/Microsoft.Authorization/roleDefinitions/owner-guid","principalId":"victim-principal"}}`,
+		},
+	}
+	r := wantType(t, Azure("Microsoft.Authorization/roleAssignments/delete", entry), "role_assignment")
+	p := decode(t, r, entry)
+	if p["target_user"] != "victim-principal" || p["principal_id"] != "victim-principal" {
+		t.Errorf("payload = %+v", p)
+	}
+	if p["action"] != "remove_role_assignment" {
+		t.Errorf("action = %v, want remove_role_assignment (so priv-escalation's narrowing guard doesn't misfire)", p["action"])
+	}
+}
+
+func TestAzureSqlRoleAssignmentDeleteFanOut(t *testing.T) {
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod/sqlRoleAssignments/ra1",
+		"properties": map[string]any{
+			"roleDefinitionId": "00000000-0000-0000-0000-000000000002",
+			"principalId":      "victim-principal",
+		},
+	}
+	got := Azure("Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/delete", entry)
+	cd := wantType(t, got, "iam_policy_attach")
+	if decode(t, cd, entry)["resource_name"] != entry["resourceId"] {
+		t.Errorf("iam_policy_attach resource_name mismatch")
+	}
+	pe := wantType(t, got, "role_assignment")
+	pep := decode(t, pe, entry)
+	if pep["target_user"] != "victim-principal" || pep["principal_id"] != "victim-principal" {
+		t.Errorf("role_assignment payload = %+v", pep)
+	}
+}
+
+func TestAzureFederatedIdentityCredentialWriteConfigChange(t *testing.T) {
+	// Federating a userAssignedIdentity to an external OIDC issuer/subject is
+	// the workload-identity-federation abuse pattern: an external principal
+	// (e.g. a GitHub Actions repo) becomes able to assume this identity with
+	// no secret exchange. Real op name confirmed via `az provider operation
+	// show --namespace Microsoft.ManagedIdentity`.
+	entry := map[string]any{
+		"caller":     "attacker@corp.com",
+		"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.ManagedIdentity/userAssignedIdentities/relay-identity/federatedIdentityCredentials/evil-cred",
+	}
+	r := wantType(t, Azure("Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureCosmosDisableLocalAuthOffConfigChange(t *testing.T) {
+	entry := map[string]any{
+		"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod",
+		"properties": map[string]any{
+			"requestbody": `{"properties":{"disableLocalAuth":false}}`,
+		},
+	}
+	r := wantType(t, Azure("Microsoft.DocumentDB/databaseAccounts/write", entry), "config_change")
+	p := decode(t, r, entry)
+	desc := fmt.Sprint(p["change_description"])
+	if !strings.Contains(desc, "AAD-only") && !strings.Contains(desc, "weakened") {
+		t.Errorf("change_description should call out the AAD-only weakening, got %+v", p)
+	}
+}
+
+func TestAzureCosmosWriteUnreadableToggleConfigChangeFallback(t *testing.T) {
+	// Real EndRequest shape: no requestbody at all -- the toggle isn't
+	// reliably readable. Per the item spec's own escape hatch: still
+	// config_change, just with the limitation noted in the description.
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod"}
+	r := wantType(t, Azure("Microsoft.DocumentDB/databaseAccounts/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureKeyVaultSecretWriteWildcardSecretAccess(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/relay-vault/secrets/db-conn"}
+	r := wantType(t, Azure("Microsoft.KeyVault/vaults/secrets/write", entry), "secret_access")
+	p := decode(t, r, entry)
+	if p["target"] != entry["resourceId"] {
+		t.Errorf("target = %v", p["target"])
+	}
+}
+
+func TestAzureKeyVaultSecretDeleteWildcardSecretAccess(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/relay-vault/secrets/db-conn"}
+	r := wantType(t, Azure("Microsoft.KeyVault/vaults/secrets/delete", entry), "secret_access")
+	p := decode(t, r, entry)
+	if p["target"] != entry["resourceId"] {
+		t.Errorf("target = %v", p["target"])
+	}
+}
+
+// TestAzureKeyVaultCasingInsensitive guards the same casing-hazard class as the
+// diagnosticSettings bug: the KeyVault secrets prefix and vaults/write must match
+// real Azure operationName casing, not just one hand-authored form.
+func TestAzureKeyVaultCasingInsensitive(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/relay-vault/secrets/db-conn"}
+	// mixed/alternate casing Azure may emit
+	wantType(t, Azure("microsoft.keyvault/vaults/secrets/read", entry), "secret_access")
+	wantType(t, Azure("Microsoft.KeyVault/Vaults/Secrets/Read", entry), "secret_access")
+	wantType(t, Azure("MICROSOFT.KEYVAULT/VAULTS/WRITE", entry), "config_change")
+}
+
+func TestAzureCosmosRegenerateKeySecretAccess(t *testing.T) {
+	// Real op name confirmed via `az provider operation show --namespace
+	// Microsoft.DocumentDB`: Microsoft.DocumentDB/databaseAccounts/regenerateKey/action.
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-nostr-relay-prod"}
+	r := wantType(t, Azure("Microsoft.DocumentDB/databaseAccounts/regenerateKey/action", entry), "secret_access")
+	p := decode(t, r, entry)
+	if p["target"] != entry["resourceId"] {
+		t.Errorf("target = %v", p["target"])
+	}
+}
+
+func TestAzureContainerRegistryWriteConfigChange(t *testing.T) {
+	// Absorbs mallcoppro-386. Live-verified: `az monitor activity-log list
+	// -g nostr-relay-prod --offset 7d` shows real
+	// Microsoft.ContainerRegistry/registries/write events (ACR SKU/network
+	// rule/admin-user changes), distinct from the already-mapped
+	// registries/push/write (image push -> dependency_add).
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.ContainerRegistry/registries/acrnostrrelayprod"}
+	r := wantType(t, Azure("Microsoft.ContainerRegistry/registries/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureManagedCertificateWriteConfigChange(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/managedEnvironments/cae-nostr-relay-prod/managedCertificates/relay-cert"}
+	r := wantType(t, Azure("Microsoft.App/managedEnvironments/managedCertificates/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+// TestAzureManagedCertificateDeleteCaseInsensitive pins the SAME casing
+// hazard already proven for Microsoft.Network/dnszones (mallcoppro-d63):
+// `az provider operation show` returns this op family lowercased
+// (microsoft.app/managedenvironments/managedcertificates/delete); a
+// case-sensitive match against the documented PascalCase form would silently
+// drop it.
+func TestAzureManagedCertificateDeleteCaseInsensitive(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/microsoft.app/managedenvironments/cae-nostr-relay-prod/managedcertificates/relay-cert"}
+	r := wantType(t, Azure("microsoft.app/managedenvironments/managedcertificates/delete", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureDiagnosticSettingWriteRemovesLAWAuditDisabled(t *testing.T) {
+	entry := map[string]any{
+		"resourceId": "/diag/setting1",
+		"properties": map[string]any{
+			"requestbody": `{"properties":{"logs":[{"category":"ContainerAppConsoleLogs","enabled":false}]}}`,
+		},
+	}
+	r := wantType(t, Azure("microsoft.insights/diagnosticSettings/write", entry), "audit_log_disabled")
+	p := decode(t, r, entry)
+	if p["resource_name"] != "/diag/setting1" {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureDiagnosticSettingWriteKeepsLAWConfigChange(t *testing.T) {
+	entry := map[string]any{
+		"resourceId": "/diag/setting1",
+		"properties": map[string]any{
+			"requestbody": `{"properties":{"workspaceId":"/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.OperationalInsights/workspaces/law-nostr-relay-prod","logs":[{"category":"ContainerAppConsoleLogs","enabled":true}]}}`,
+		},
+	}
+	r := wantType(t, Azure("microsoft.insights/diagnosticSettings/write", entry), "config_change")
+	p := decode(t, r, entry)
+	if p["resource_name"] != "/diag/setting1" {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+// TestAzureDiagnosticSettingWriteUnreadableDefaultsAuditDisabled matches the
+// REAL EndRequest shape (no requestbody at all -- see the package doc block
+// above): when the LAW-removal toggle can't be verified, default to the
+// audit-blinding alert rather than silently downgrading, since a missed
+// audit-disable is worse than a false-positive review.
+func TestAzureDiagnosticSettingWriteUnreadableDefaultsAuditDisabled(t *testing.T) {
+	entry := map[string]any{"resourceId": "/diag/setting1"}
+	r := wantType(t, Azure("microsoft.insights/diagnosticSettings/write", entry), "audit_log_disabled")
+	p := decode(t, r, entry)
+	if p["resource_name"] != "/diag/setting1" {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+// TestAzureDiagnosticSettingRealCasingWriteCaughtLive pins a live-proof-caught
+// bug: a real captured event from nostr-relay-prod's Activity Log (az monitor
+// activity-log list -g nostr-relay-prod --offset 7d, 2026-07-21) has
+// operationName.value "Microsoft.Insights/diagnosticSettings/write" (capital
+// M, capital I) -- the pre-existing exact-lowercase match
+// ("microsoft.insights/diagnosticSettings/write") never matched this and
+// silently fell through to CatchAll in production, meaning the
+// audit-blinding detector NEVER fired for a real diagnostic-settings write.
+// Same casing-inconsistency class already proven for Microsoft.Network/
+// dnszones (mallcoppro-d63).
+func TestAzureDiagnosticSettingRealCasingWriteCaughtLive(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/nostr-relay-prod/providers/Microsoft.Insights/diagnosticSettings/relay-diag"}
+	r := wantType(t, Azure("Microsoft.Insights/diagnosticSettings/write", entry), "audit_log_disabled")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
+	}
+}
+
+func TestAzureDiagnosticSettingRealCasingDeleteCaughtLive(t *testing.T) {
+	entry := map[string]any{"resourceId": "/subscriptions/s/resourceGroups/nostr-relay-prod/providers/Microsoft.App/containerApps/nostr-relay-prod/providers/Microsoft.Insights/diagnosticSettings/relay-diag"}
+	r := wantType(t, Azure("Microsoft.Insights/diagnosticSettings/delete", entry), "audit_trail_delete")
+	p := decode(t, r, entry)
+	if p["resource_name"] != entry["resourceId"] {
+		t.Errorf("resource_name = %v", p["resource_name"])
 	}
 }
 
