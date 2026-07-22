@@ -1,10 +1,15 @@
 // Command loganalytics is a one-shot poller of the Azure Log Analytics query
 // API (mallcoppro-9701). It surfaces the nostr-relay's application-plane
-// relay_security structured log lines (mallcoppro-813) — auth-gate
-// rejections, rate-limit rejections, NIP-86 admin calls, and accepted
-// tombstones — as normalized mallcop events. It is the app-plane sibling of
-// cmd/azure, which already covers this relay's Azure control-plane
-// (Microsoft.App/*, Microsoft.DocumentDB/*, DNS) operations.
+// relay_security structured log lines (mallcoppro-813) as normalized mallcop
+// events, narrowed (mallcoppro-f1a) to only the AUTHORIZATION-BOUNDARY
+// signals: allowlist-breach probing (unauthorized_writer / nip42_auth_failure)
+// and write-allowlist grant/revoke admin calls (nip86_admin_call's
+// allowpubkey/banpubkey methods). Rate-limit rejections, accepted tombstones,
+// and balance-gate rejections are usage/billing, not infrastructure
+// subversion, and are deliberately excluded — see
+// internal/normalize/loganalytics.go's LogAnalytics doc comment. It is the
+// app-plane sibling of cmd/azure, which already covers this relay's Azure
+// control-plane (Microsoft.App/*, Microsoft.DocumentDB/*, DNS) operations.
 //
 // Usage:
 //
@@ -87,11 +92,17 @@ func validateCursor(cursor string) error {
 	return nil
 }
 
-// sigKey derives the cursor HMAC key from the workspace GUID — the same
-// "scope the key to the one thing this run reads from" pattern as cmd/azure's
-// sigKey(subscriptionID) and cmd/mercury's sigKey(token).
-func sigKey(workspaceID string) []byte {
-	return []byte(fmt.Sprintf("mallcop-loganalytics-cursor:%s", workspaceID))
+// sigKey derives the cursor HMAC key from the service principal's
+// AZURE_CLIENT_SECRET — mirroring cmd/mercury's sigKey(token): the workspace
+// GUID (customerId) is a PUBLIC identifier printed in Azure Portal URLs and
+// diagnostic settings, so a key derived from it (the previous scheme,
+// mallcoppro-834) let anyone who merely knew the workspace id forge a valid
+// cursor and skip an arbitrary window of relay_security rows — no possession
+// of the actual SP credential required. Deriving from the client secret
+// instead means forging a cursor requires the secret itself, the same bar
+// cmd/mercury already set for its own cursor.
+func sigKey(clientSecret string) []byte {
+	return []byte(fmt.Sprintf("mallcop-loganalytics-cursor:%s", clientSecret))
 }
 
 func encodeCursor(raw string, key []byte) string {
@@ -395,7 +406,7 @@ func run() error {
 		}
 	}
 
-	key := sigKey(*workspaceID)
+	key := sigKey(clientSecret)
 	floor, err := resolveFloor(*cursorArg, sinceTime, key)
 	if err != nil {
 		return err

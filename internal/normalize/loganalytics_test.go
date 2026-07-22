@@ -3,17 +3,25 @@ package normalize
 import "testing"
 
 // --- LogAnalytics (relay_security decision -> mallcop Type) ----------------
+//
+// mallcoppro-f1a re-scope: this connector now maps ONLY the
+// authorization-boundary decisions (unauthorized_writer / nip42_auth_failure
+// -> login_failure; nip86_admin_call's allowpubkey/banpubkey methods ->
+// iam_policy_attach + role_assignment fan-out). rate_limited,
+// nip09_tombstone, and balance_gate_rejected are usage/billing and now
+// produce ZERO Results. The tests below assert both directions: the KEPT
+// decisions map correctly, and the DROPPED decisions produce nothing.
 
 // TestLogAnalyticsAuthFailureDecisions covers every decision that represents
-// a rejected write/auth attempt: the Type MUST be byte-equal to
-// mallcop/core/detect/auth_failure_burst.go's authFailureEventTypes gate
-// literal "login_failure" (verified by reading that file directly,
-// 2026-07-21) so a burst of same-pubkey rejections fires auth-failure-burst.
+// an authorization-boundary rejected write/auth attempt: the Type MUST be
+// byte-equal to mallcop/core/detect/auth_failure_burst.go's
+// authFailureEventTypes gate literal "login_failure" (verified by reading
+// that file directly, 2026-07-21) so a burst of same-pubkey rejections
+// fires auth-failure-burst.
 func TestLogAnalyticsAuthFailureDecisions(t *testing.T) {
 	cases := []string{
 		"nip42_auth_failure",
 		"unauthorized_writer",
-		"balance_gate_rejected",
 	}
 	for _, decision := range cases {
 		t.Run(decision, func(t *testing.T) {
@@ -42,35 +50,34 @@ func TestLogAnalyticsAuthFailureDecisions(t *testing.T) {
 	}
 }
 
-// TestLogAnalyticsRateLimited asserts the Type equals rate_anomaly.go's
-// inline ev.Type gate literal "rate_event" exactly.
-func TestLogAnalyticsRateLimited(t *testing.T) {
-	got := LogAnalytics("rate_limited", "", "198.51.100.7", "relay.moot.pub", "rate-limited: too many anonymous requests from this IP, try again later")
-	if len(got) != 1 {
-		t.Fatalf("want 1 result, got %d: %+v", len(got), got)
+// TestLogAnalyticsUsageBillingDecisionsProduceNoFinding proves the three
+// usage/billing decisions produce ZERO Results — not a finding, not even
+// the inert CatchAll — regardless of what pubkey/detail they carry.
+func TestLogAnalyticsUsageBillingDecisionsProduceNoFinding(t *testing.T) {
+	cases := []struct {
+		name     string
+		decision string
+		detail   string
+	}{
+		{"rate_limited", "rate_limited", "rate-limited: too many anonymous requests from this IP, try again later"},
+		{"nip09_tombstone", "nip09_tombstone", "tombstoned event id=abc123def456"},
+		{"balance_gate_rejected", "balance_gate_rejected", "restricted: insufficient donut balance"},
 	}
-	r := got[0]
-	if r.Type != "rate_event" {
-		t.Errorf("Type = %q, want rate_event", r.Type)
-	}
-	if r.Type != LogAnalyticsRateEventType {
-		t.Errorf("Type %q does not match exported LogAnalyticsRateEventType %q", r.Type, LogAnalyticsRateEventType)
-	}
-	p := decode(t, r, map[string]any{})
-	if p["request_count"] != float64(1) && p["request_count"] != 1 {
-		t.Errorf("request_count = %v, want 1", p["request_count"])
-	}
-	if p["ip"] != "198.51.100.7" {
-		t.Errorf("ip = %v", p["ip"])
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := LogAnalytics(c.decision, "somepubkey", "198.51.100.7", "relay.moot.pub", c.detail)
+			if len(got) != 0 {
+				t.Fatalf("want 0 results (usage/billing must produce no finding), got %d: %+v", len(got), got)
+			}
+		})
 	}
 }
 
-// TestLogAnalyticsNIP86AdminCallFanOut asserts the unconditional two-way
-// fan-out to config-drift's "iam_policy_attach" gate and priv-escalation's
-// "role_assignment" gate, mirroring azure.go's Cosmos DB SQL role assignment
-// mapping (both literals confirmed live in mallcop/core/detect/config_drift.go
-// and priv_escalation.go's gate tables).
-func TestLogAnalyticsNIP86AdminCallFanOut(t *testing.T) {
+// TestLogAnalyticsNIP86AllowlistGrantFanOut asserts the allowpubkey GRANT
+// method fans out to config-drift's "iam_policy_attach" gate and
+// priv-escalation's "role_assignment" gate, carrying the target pubkey +
+// method + outcome.
+func TestLogAnalyticsNIP86AllowlistGrantFanOut(t *testing.T) {
 	got := LogAnalytics("nip86_admin_call", "adminpubkeyhex", "", "", "method=allowpubkey outcome=allow")
 	if len(got) != 2 {
 		t.Fatalf("want 2 fan-out results, got %d: %+v", len(got), got)
@@ -84,6 +91,9 @@ func TestLogAnalyticsNIP86AdminCallFanOut(t *testing.T) {
 	if cdp["resource_name"] != "nostr-relay" {
 		t.Errorf("iam_policy_attach resource_name = %v", cdp["resource_name"])
 	}
+	if cdp["change_description"] != "NIP-86 admin call: method=allowpubkey outcome=allow" {
+		t.Errorf("iam_policy_attach change_description = %v", cdp["change_description"])
+	}
 
 	pe := wantType(t, got, "role_assignment")
 	pep := decode(t, pe, map[string]any{})
@@ -93,44 +103,54 @@ func TestLogAnalyticsNIP86AdminCallFanOut(t *testing.T) {
 	if pep["target_user"] != "adminpubkeyhex" {
 		t.Errorf("role_assignment target_user = %v, want adminpubkeyhex", pep["target_user"])
 	}
+	if pep["principal_id"] != "adminpubkeyhex" {
+		t.Errorf("role_assignment principal_id = %v, want adminpubkeyhex", pep["principal_id"])
+	}
 }
 
-// TestLogAnalyticsNIP86AdminCallDenyStillFansOut proves the fan-out does NOT
-// condition on outcome=allow vs outcome=deny — every admin call is a
-// privileged-surface mutation attempt regardless of whether it succeeded,
-// mirroring the Cosmos SQL role assignment precedent's unconditional
-// fan-out.
-func TestLogAnalyticsNIP86AdminCallDenyStillFansOut(t *testing.T) {
+// TestLogAnalyticsNIP86AllowlistRevokeDenyStillFansOut proves the revoke
+// (banpubkey) method also fans out, and that a DENIED admin-call attempt
+// (a non-admin caller probing the admin surface) still fans out — the
+// fan-out does not condition on outcome=allow vs outcome=deny, mirroring
+// the Cosmos SQL role assignment precedent's unconditional fan-out.
+func TestLogAnalyticsNIP86AllowlistRevokeDenyStillFansOut(t *testing.T) {
 	got := LogAnalytics("nip86_admin_call", "", "", "", "method=banpubkey outcome=deny")
 	if len(got) != 2 {
-		t.Fatalf("want 2 fan-out results even for a denied call, got %d: %+v", len(got), got)
+		t.Fatalf("want 2 fan-out results even for a denied grant/revoke call, got %d: %+v", len(got), got)
+	}
+	types := map[string]bool{got[0].Type: true, got[1].Type: true}
+	if !types["iam_policy_attach"] || !types["role_assignment"] {
+		t.Errorf("want iam_policy_attach + role_assignment, got %v", types)
 	}
 }
 
-// TestLogAnalyticsNIP09Tombstone asserts reuse of the SAME literal
-// azure.go/gcp.go already use (and mallcop's detector proves) for
-// audit-trail deletions — config-drift's configRuleByEventType has no
-// ev.Source gate, so this fires identically whether the delete was observed
-// via a raw nostr event or the relay's own accept-side security log.
-func TestLogAnalyticsNIP09Tombstone(t *testing.T) {
-	got := LogAnalytics("nip09_tombstone", "authorpubkeyhex", "", "", "tombstoned event id=abc123def456")
-	if len(got) != 1 {
-		t.Fatalf("want 1 result, got %d: %+v", len(got), got)
+// TestLogAnalyticsNIP86NonAllowlistMethodsProduceNoFinding proves that
+// nip86_admin_call methods OTHER than allowpubkey/banpubkey — the read-only
+// capability surface (supportedmethods, listallowedpubkeys) and any
+// unrecognized method a caller invents — are NOT a security-config change
+// and produce zero Results, regardless of outcome.
+func TestLogAnalyticsNIP86NonAllowlistMethodsProduceNoFinding(t *testing.T) {
+	cases := []string{
+		"method=supportedmethods outcome=allow",
+		"method=listallowedpubkeys outcome=allow",
+		"method=listallowedpubkeys outcome=deny",
+		"method=someunknownmethod outcome=deny",
 	}
-	r := got[0]
-	if r.Type != "audit_trail_delete" {
-		t.Errorf("Type = %q, want audit_trail_delete", r.Type)
-	}
-	p := decode(t, r, map[string]any{})
-	if p["resource_name"] != "abc123def456" {
-		t.Errorf("resource_name = %v, want abc123def456", p["resource_name"])
+	for _, detail := range cases {
+		t.Run(detail, func(t *testing.T) {
+			got := LogAnalytics("nip86_admin_call", "callerpubkey", "", "", detail)
+			if len(got) != 0 {
+				t.Fatalf("want 0 results for non-allowlist admin method (%q), got %d: %+v", detail, len(got), got)
+			}
+		})
 	}
 }
 
 // TestLogAnalyticsUnknownDecisionFallsBackToCatchAll proves a decision this
 // connector doesn't recognize (e.g. a future seclog.Decision* added to the
 // relay before this connector is updated) still reaches the type-less
-// detectors instead of being dropped or crashing.
+// detectors instead of being dropped or crashing — distinct from the
+// KNOWN usage/billing decisions above, which are deliberately dropped.
 func TestLogAnalyticsUnknownDecisionFallsBackToCatchAll(t *testing.T) {
 	got := LogAnalytics("some_future_decision", "pk", "1.2.3.4", "d", "detail text")
 	if len(got) != 1 {
@@ -141,11 +161,30 @@ func TestLogAnalyticsUnknownDecisionFallsBackToCatchAll(t *testing.T) {
 	}
 }
 
-// TestParseNIP86Method / TestParseTombstoneEventID exercise the detail-string
-// parsers directly against the EXACT formats the relay's own source emits
-// (nip86admin.go's `"method="+mp.MethodName()+" outcome="+outcome` and
-// store.go's `"tombstoned event id="+evt.ID` — verified by reading both
-// files, 2026-07-21) plus defensive malformed-input cases.
+// TestNIP86AdminIsAllowlistChange exercises the method-name gate directly.
+func TestNIP86AdminIsAllowlistChange(t *testing.T) {
+	cases := []struct {
+		method string
+		want   bool
+	}{
+		{"allowpubkey", true},
+		{"banpubkey", true},
+		{"listallowedpubkeys", false},
+		{"supportedmethods", false},
+		{"", false},
+		{"AllowPubKey", false}, // khatru's MethodName() is always lowercase; no case-fold
+	}
+	for _, c := range cases {
+		if got := nip86AdminIsAllowlistChange(c.method); got != c.want {
+			t.Errorf("nip86AdminIsAllowlistChange(%q) = %v, want %v", c.method, got, c.want)
+		}
+	}
+}
+
+// TestParseNIP86Method exercises the detail-string parser directly against
+// the EXACT format the relay's own source emits (nip86admin.go's
+// `"method="+mp.MethodName()+" outcome="+outcome` — verified by reading that
+// file, 2026-07-21) plus defensive malformed-input cases.
 func TestParseNIP86Method(t *testing.T) {
 	cases := []struct{ detail, want string }{
 		{"method=allowpubkey outcome=allow", "allowpubkey"},
@@ -156,19 +195,6 @@ func TestParseNIP86Method(t *testing.T) {
 	for _, c := range cases {
 		if got := parseNIP86Method(c.detail); got != c.want {
 			t.Errorf("parseNIP86Method(%q) = %q, want %q", c.detail, got, c.want)
-		}
-	}
-}
-
-func TestParseTombstoneEventID(t *testing.T) {
-	cases := []struct{ detail, want string }{
-		{"tombstoned event id=abc123", "abc123"},
-		{"no id here", ""},
-		{"", ""},
-	}
-	for _, c := range cases {
-		if got := parseTombstoneEventID(c.detail); got != c.want {
-			t.Errorf("parseTombstoneEventID(%q) = %q, want %q", c.detail, got, c.want)
 		}
 	}
 }

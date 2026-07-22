@@ -23,7 +23,7 @@ func queryBaseOverride(serverURL string) func() {
 // --- cursor roundtrip / tamper detection (byte-identical pattern to cmd/azure) ---
 
 func TestCursorRoundtrip(t *testing.T) {
-	key := sigKey("ws-12345")
+	key := sigKey("sp-secret-12345")
 	raw := "2026-07-20T15:10:18.7459745Z"
 
 	encoded := encodeCursor(raw, key)
@@ -40,7 +40,7 @@ func TestCursorRoundtrip(t *testing.T) {
 }
 
 func TestCursorTamperDetection(t *testing.T) {
-	key := sigKey("ws-abc")
+	key := sigKey("sp-secret-abc")
 	raw := "2026-07-20T15:10:18Z"
 
 	encoded := encodeCursor(raw, key)
@@ -59,8 +59,8 @@ func TestCursorTamperDetection(t *testing.T) {
 }
 
 func TestCursorWrongKey(t *testing.T) {
-	key1 := sigKey("ws-aaa")
-	key2 := sigKey("ws-bbb")
+	key1 := sigKey("sp-secret-aaa")
+	key2 := sigKey("sp-secret-bbb")
 	raw := "2026-07-20T15:10:18Z"
 
 	encoded := encodeCursor(raw, key1)
@@ -72,7 +72,7 @@ func TestCursorWrongKey(t *testing.T) {
 // --- resolveFloor ---
 
 func TestResolveFloorSinceOnly(t *testing.T) {
-	key := sigKey("ws-x")
+	key := sigKey("sp-secret-x")
 	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	floor, err := resolveFloor("", since, key)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestResolveFloorSinceOnly(t *testing.T) {
 }
 
 func TestResolveFloorCursorLaterThanSinceWins(t *testing.T) {
-	key := sigKey("ws-y")
+	key := sigKey("sp-secret-y")
 	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	cursorTime := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
 	cursor := encodeCursor(cursorTime.Format(time.RFC3339Nano), key)
@@ -99,7 +99,7 @@ func TestResolveFloorCursorLaterThanSinceWins(t *testing.T) {
 }
 
 func TestResolveFloorTamperedCursorHardFails(t *testing.T) {
-	key := sigKey("ws-tamper")
+	key := sigKey("sp-secret-tamper")
 	encoded := encodeCursor("2026-07-20T15:10:18Z", key)
 	parts := strings.SplitN(encoded, ".", 2)
 	payload := []byte(parts[0])
@@ -117,7 +117,7 @@ func TestResolveFloorNonTimestampCursorHardFails(t *testing.T) {
 	// timestamp (no legacy pagination-token format to migrate from), so a
 	// non-timestamp HMAC-valid payload is just a bad cursor, not a
 	// self-healing legacy case.
-	key := sigKey("ws-nonts")
+	key := sigKey("sp-secret-nonts")
 	encoded := encodeCursor("not-a-timestamp", key)
 	_, err := resolveFloor(encoded, time.Time{}, key)
 	if err == nil {

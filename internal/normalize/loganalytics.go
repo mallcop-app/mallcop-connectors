@@ -16,91 +16,135 @@ import "strings"
 // that module (separate repo/module), so the strings are duplicated here
 // rather than shared.
 //
+// mallcoppro-f1a RE-SCOPE: this connector previously ingested EVERY
+// relay_security decision, including rate_limited / nip09_tombstone /
+// balance_gate_rejected — those are USAGE/billing signals (a paying client
+// hit its rate cap, a paid tombstone was accepted, a request was rejected
+// for insufficient balance), not infrastructure subversion, and produced
+// noisy findings a security operator has no action to take on. This
+// connector now maps ONLY the two AUTHORIZATION-BOUNDARY signal families:
+// (1) nip86_admin_call, narrowed further to just the write-allowlist
+// GRANT/REVOKE methods (allowpubkey/banpubkey) — someone changing WHO may
+// write to the relay; (2) unauthorized_writer (and, defensively,
+// nip42_auth_failure — see below) — a non-admitted pubkey trying to write
+// or authenticate and being rejected, framed as allowlist-breach probing.
+// rate_limited, nip09_tombstone, and balance_gate_rejected now produce NO
+// Result at all (see the decision switch below) rather than a CatchAll
+// pass-through, so this connector's output is exclusively
+// authorization-boundary events.
+//
 // decisionNIP42AuthFailure is defined in seclog.go but NOT currently wired to
 // any call site in the relay (mallcoppro-813's live-proof escalation: no
 // non-vendor khatru hook point exists for the raw NIP-42 AUTH envelope
 // failure without hand-patching vendored khatru, which that item's scope
 // forbade — accepted descope mallcoppro-a26). It is still mapped here
-// (defensively, alongside the two decisions that DO fire in prod) in case a
-// future relay change wires it in; today it will simply never appear in a
-// live query result.
+// (defensively, alongside unauthorized_writer, which DOES fire in prod) in
+// case a future relay change wires it in — it is squarely an
+// authorization-boundary failure (a failed proof-of-identity), not a
+// usage/billing signal, so it stays in scope even though the KEEP list this
+// item was scoped against only calls out unauthorized_writer by name; today
+// it will simply never appear in a live query result.
 const (
 	decisionNIP42AuthFailure    = "nip42_auth_failure"
 	decisionUnauthorizedWriter  = "unauthorized_writer"
-	decisionBalanceGateRejected = "balance_gate_rejected"
-	decisionRateLimited         = "rate_limited"
+	decisionBalanceGateRejected = "balance_gate_rejected" // usage/billing — DROP
+	decisionRateLimited         = "rate_limited"          // usage/billing — DROP
 	decisionNIP86AdminCall      = "nip86_admin_call"
-	decisionNIP09Tombstone      = "nip09_tombstone"
+	decisionNIP09Tombstone      = "nip09_tombstone" // usage/billing — DROP
 )
 
 // LogAnalyticsAuthFailureEventType is the canonical Type for every relay
-// decision that represents a failed authentication/authorization attempt to
-// write or connect (nip42_auth_failure, unauthorized_writer,
-// balance_gate_rejected) — it MUST exactly equal
-// mallcop/core/detect/auth_failure_burst.go's authFailureEventTypes gate
-// literal ("login_failure") so a repeated-rejection burst from the same
-// pubkey (credential-stuffing-shaped probing of the relay's write gates)
-// fires auth-failure-burst exactly like a repeated failed console login
-// would for any other connector.
+// decision that represents a failed authorization-boundary attempt to write
+// or connect (nip42_auth_failure, unauthorized_writer) — it MUST exactly
+// equal mallcop/core/detect/auth_failure_burst.go's authFailureEventTypes
+// gate literal ("login_failure") so a repeated-rejection burst from the same
+// pubkey (allowlist-breach probing: a non-admitted key repeatedly trying to
+// write or authenticate) fires auth-failure-burst exactly like a repeated
+// failed console login would for any other connector.
 const LogAnalyticsAuthFailureEventType = "login_failure"
 
-// LogAnalyticsRateEventType is the canonical Type for a rate_limited
-// decision — it MUST exactly equal mallcop/core/detect/rate_anomaly.go's
-// inline ev.Type gate literal ("rate_event") so relay rate-limit rejections
-// feed the rate/volume-anomaly detector.
-const LogAnalyticsRateEventType = "rate_event"
-
-// LogAnalytics maps a single relay_security line to one or more Results. An
-// unrecognized decision string (a future seclog.Decision* the relay adds
-// before this connector is updated) falls through to CatchAll rather than
-// being dropped, so it still reaches the type-less detectors instead of
-// silently vanishing.
+// LogAnalytics maps a single relay_security line to zero or more Results.
+//
+// Only two decision families produce a Result: the auth-failure-burst family
+// (nip42_auth_failure / unauthorized_writer, both authorization-boundary
+// rejections) and the nip86_admin_call GRANT/REVOKE family (a write-allowlist
+// membership change — see nip86AdminIsAllowlistChange below). Every other
+// relay_security decision produces NO Result:
+//
+//   - rate_limited / nip09_tombstone / balance_gate_rejected are USAGE/billing
+//     signals (a paying client hit its rate cap, a paid tombstone was
+//     accepted, a request was rejected for insufficient balance) — not
+//     infrastructure subversion — and are dropped ENTIRELY (mallcoppro-f1a
+//     re-scope): no Result, not even the inert CatchAll, so this connector's
+//     output is exclusively authorization-boundary events.
+//   - a nip86_admin_call whose method is not a write-allowlist grant/revoke
+//     (e.g. "supportedmethods", "listallowedpubkeys", or any method name a
+//     caller invents) is not a security-config change either and is also
+//     dropped.
+//   - a genuinely UNRECOGNIZED decision string (a future seclog.Decision* the
+//     relay adds before this connector is updated) still falls through to
+//     CatchAll rather than being silently dropped — that is the one case
+//     where "we don't know what this is yet" should still reach the
+//     type-less detectors, as distinct from "we know exactly what this is
+//     and it's usage, not security."
 func LogAnalytics(decision, pubkey, remote, domain, detail string) []Result {
 	switch decision {
 
-	// --- auth-failure-burst: nip42_auth_failure / unauthorized_writer /
-	// balance_gate_rejected are all "this pubkey tried to do something that
-	// requires standing and was rejected" — the same brute-force/probing
-	// shape auth-failure-burst already detects for login_failure. actor
+	// --- auth-failure-burst: nip42_auth_failure / unauthorized_writer are
+	// both "this pubkey tried to write or authenticate without standing on
+	// this relay's write-allowlist and was rejected" — allowlist-breach
+	// PROBING, the same brute-force/probing shape auth-failure-burst already
+	// detects for login_failure, not a per-event new-actor signal. actor
 	// (the caller's pubkey) is set by cmd/loganalytics from the same
 	// `pubkey` field, so repeated rejections from one pubkey accrue exactly
 	// like repeated login_failure events from one username.
-	case decisionNIP42AuthFailure, decisionUnauthorizedWriter, decisionBalanceGateRejected:
-		p := map[string]any{"action": "auth_failure", "decision": decision}
+	case decisionNIP42AuthFailure, decisionUnauthorizedWriter:
+		p := map[string]any{"action": "allowlist_breach_probe", "decision": decision}
 		set(p, "reason", detail)
 		set(p, "ip", remote)
 		set(p, "source_ip", remote)
 		set(p, "domain", domain)
 		return []Result{{Type: LogAnalyticsAuthFailureEventType, Payload: p}}
 
-	// --- rate-anomaly: one rejected request per line, so request_count is
-	// always 1 (rateAnomalyEvaluate treats a missing/zero request_count as
-	// 1 anyway; set explicitly for clarity that this is a single-request
-	// signal, not a pre-aggregated burst count).
+	// --- usage/billing — DROP entirely, no Result (mallcoppro-f1a). A
+	// rejected-for-rate-limit request carries no authorization-boundary
+	// signal: the caller may be perfectly admitted and simply over its
+	// quota. Not routed to CatchAll — this is a KNOWN, deliberately-excluded
+	// decision, not an unrecognized one.
 	case decisionRateLimited:
-		p := map[string]any{"action": "rate_limited", "decision": decision, "request_count": 1}
-		set(p, "reason", detail)
-		set(p, "ip", remote)
-		set(p, "domain", domain)
-		return []Result{{Type: LogAnalyticsRateEventType, Payload: p}}
+		return nil
 
-	// --- priv-escalation + config-drift fan-out: every NIP-86 relay
-	// management API call (allow/ban/list/supportedmethods, allow AND deny
-	// outcomes alike — nip86admin.go's RejectNonAdminAPICall logs this
-	// decision for EVERY method call, not just grant-shaped ones) is an
-	// admin mutation of the relay's write-allowlist surface. Unconditional
-	// fan-out, mirroring azure.go's Microsoft.DocumentDB/databaseAccounts/
+	// --- usage/billing — DROP entirely, no Result (mallcoppro-f1a). A
+	// balance-gate rejection is a billing outcome (insufficient donut
+	// balance), not a subversion of the relay's security boundary.
+	case decisionBalanceGateRejected:
+		return nil
+
+	// --- priv-escalation + config-drift fan-out, NARROWED to the
+	// write-allowlist GRANT/REVOKE methods only (mallcoppro-f1a re-scope).
+	// nip86admin.go's RejectNonAdminAPICall logs this decision for EVERY
+	// NIP-86 method call (allow/ban/list/supportedmethods alike), but only
+	// AllowPubKey/BanPubKey actually change WHO may write to the relay —
+	// list/supportedmethods are read-only capability surface, not a
+	// security-config change, so they are dropped (see
+	// nip86AdminIsAllowlistChange). Fan-out still fires on both allow AND
+	// deny outcomes for a grant/revoke method call: a DENIED attempt to call
+	// AllowPubKey/BanPubKey by a non-admin caller is itself an
+	// authorization-boundary probe against the relay's admin surface,
+	// mirroring azure.go's Microsoft.DocumentDB/databaseAccounts/
 	// sqlRoleAssignments/write mapping (a Cosmos DB SQL RBAC grant, which
 	// also fans out to iam_policy_attach + role_assignment unconditionally
-	// because that gate has no "unprivileged tier" to condition on) — NIP-86
-	// admin calls have no such tier either: this relay's whole write-
-	// allowlist model is a single privileged surface.
+	// because that gate has no "unprivileged tier" to condition on) — this
+	// relay's write-allowlist model has no such tier either.
 	//
 	// detail is "method=<name> outcome=<allow|deny>" (nip86admin.go); method
-	// is parsed out for payload richness (role/policy_name) but the fan-out
-	// itself does not condition on it or on outcome.
+	// is parsed out both to gate on (grant/revoke family only) and for
+	// payload richness (role/policy_name).
 	case decisionNIP86AdminCall:
 		method := parseNIP86Method(detail)
+		if !nip86AdminIsAllowlistChange(method) {
+			return nil
+		}
 		cd := map[string]any{"action": "admin_call"}
 		set(cd, "resource_name", "nostr-relay")
 		set(cd, "policy_name", method)
@@ -115,24 +159,31 @@ func LogAnalytics(decision, pubkey, remote, domain, detail string) []Result {
 			{Type: "role_assignment", Payload: pe},
 		}
 
-	// --- delete/drift family: "audit_trail_delete" is the SAME literal
-	// azure.go's diagnosticSettings/delete and gcp.go's DeleteSink mappings
-	// already use (config-drift's configRuleByEventType gates on it with NO
-	// ev.Source check) — a relay accepting/applying a NIP-09 tombstone is
-	// the same "a piece of the append-only record was told to disappear"
-	// signal, just observed from the relay's own accept-side security log
-	// rather than the raw nostr event. Written as a literal (not a shared
-	// exported constant) to match the existing azure.go/gcp.go precedent —
-	// each per-cloud mapper owns its own literal rather than importing
-	// another mapper's.
+	// --- usage/billing — DROP entirely, no Result (mallcoppro-f1a). An
+	// accepted NIP-09 tombstone is the relay processing a paid delete
+	// request, not a config-drift-shaped audit-trail tamper — the customer
+	// exercised a right their own key already had, no boundary was crossed.
 	case decisionNIP09Tombstone:
-		p := map[string]any{"action": "delete", "config_key": "nostr_event"}
-		set(p, "resource_name", parseTombstoneEventID(detail))
-		p["change_description"] = detail
-		return []Result{{Type: "audit_trail_delete", Payload: p}}
+		return nil
 	}
 
 	return []Result{{Type: CatchAll, Payload: map[string]any{"action": "relay_security:" + decision}}}
+}
+
+// nip86AdminIsAllowlistChange reports whether method is one of the two
+// NIP-86 methods that actually GRANT or REVOKE write-allowlist membership
+// (khatru's method-name constants — see
+// vendor/github.com/nbd-wtf/go-nostr/nip86/methods.go's AllowPubKey/BanPubKey
+// MethodName() implementations, both lowercase with no separator). Every
+// other method this relay wires (listallowedpubkeys, supportedmethods) or
+// that a caller might invent is read-only capability surface or unsupported,
+// not a security-config change.
+func nip86AdminIsAllowlistChange(method string) bool {
+	switch method {
+	case "allowpubkey", "banpubkey":
+		return true
+	}
+	return false
 }
 
 // parseNIP86Method extracts the method name from a nip86admin.go detail
@@ -150,16 +201,4 @@ func parseNIP86Method(detail string) string {
 		return rest[:sp]
 	}
 	return rest
-}
-
-// parseTombstoneEventID extracts the deleted event id from a store.go detail
-// string of the form "tombstoned event id=<id>". Returns "" if the expected
-// "id=" suffix isn't found.
-func parseTombstoneEventID(detail string) string {
-	const marker = "id="
-	idx := strings.LastIndex(detail, marker)
-	if idx < 0 {
-		return ""
-	}
-	return detail[idx+len(marker):]
 }
